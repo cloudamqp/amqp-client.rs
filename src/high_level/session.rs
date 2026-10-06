@@ -5,6 +5,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -103,10 +105,10 @@ impl ClientInner {
         self.slot.lock().unwrap().session.clone()
     }
 
-    /// Runs `op` on a usable session. With recovery on, it first waits (at
-    /// most the recovery timeout) for recovery in progress, and if `op` finds
-    /// the session lost, triggers recovery, waits for it the same way and runs
-    /// `op` once more.
+    /// Runs `op` on a usable session. With recovery on, it first waits for
+    /// recovery in progress, and if `op` finds the session lost, triggers
+    /// recovery, waits for it and runs `op` once more. All waiting together
+    /// takes at most the recovery timeout.
     pub(crate) async fn with_session<R, F, Fut>(self: &Arc<Self>, op: F) -> Result<R, Error>
     where
         F: Fn(Arc<Session>) -> Fut,
@@ -115,6 +117,8 @@ impl ClientInner {
         let Some(timeout) = self.recovery.as_ref().map(|r| r.timeout) else {
             return run_on(self.current(), &op).await;
         };
+        let deadline = Instant::now() + timeout;
+        let remaining = || Some(deadline.saturating_duration_since(Instant::now()));
         let session = {
             let slot = self.slot.lock().unwrap();
             (!slot.recovering).then(|| slot.session.clone())
@@ -123,13 +127,13 @@ impl ClientInner {
             Some(session) => session,
             None => {
                 let generation = self.current().generation;
-                session_after(Arc::downgrade(self), generation, Some(timeout)).await?
+                session_after(Arc::downgrade(self), generation, remaining()).await?
             }
         };
         match run_on(session.clone(), &op).await {
             Err(Error::ConnectionClosed { .. }) => {
                 let next =
-                    session_after(Arc::downgrade(self), session.generation, Some(timeout)).await?;
+                    session_after(Arc::downgrade(self), session.generation, remaining()).await?;
                 run_on(next, &op).await
             }
             result => result,
