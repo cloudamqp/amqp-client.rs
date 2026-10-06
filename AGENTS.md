@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues are tracked in Epiq, a repo-native terminal issue tracker that stores and syncs issue state through Git. See `docs/agents/issue-tracker.md`.
+Issues are tracked as GitHub issues on `cloudamqp/amqp-client.rs`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

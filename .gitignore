@@ -1,6 +1,2 @@
 /target
 .crush/
-
-# [epiq]: local hydrated state is never committed
-.epiq/events/
-.epiq/log/
