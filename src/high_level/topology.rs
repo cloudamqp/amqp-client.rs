@@ -6,6 +6,7 @@ use crate::{ExchangeDeclareOpts, QueueDeclareOpts, Table};
 /// Identifies a recorded queue; stable across renames of server-named queues.
 pub(crate) type QueueId = u64;
 
+#[derive(Clone)]
 pub(crate) struct RecordedExchange {
     pub(crate) name: String,
     pub(crate) kind: String,

@@ -91,8 +91,8 @@ impl<C: Codec> Queue<C> {
         &self,
         opts: SubscribeOpts,
     ) -> Result<TypedConsumer<T, C>, Error> {
-        let (generation, channel, consumer) = self
-            .client()?
+        let client = self.client()?;
+        let (generation, channel, consumer) = client
             .with_session(|s| {
                 let (name, opts) = (self.name(), opts.clone());
                 async move {
@@ -102,10 +102,12 @@ impl<C: Codec> Queue<C> {
                 }
             })
             .await?;
+        let registration = client.recovery().map(|_| client.register_consumer());
         Ok(TypedConsumer::new(
             consumer,
             channel,
             generation,
+            registration,
             self.clone(),
             opts,
         ))
@@ -177,6 +179,10 @@ impl<C: Codec> Queue<C> {
             code: 0,
             reason: "client dropped".into(),
         })
+    }
+
+    pub(crate) fn weak_client(&self) -> Weak<ClientInner> {
+        self.client.clone()
     }
 
     /// Whether the queue is still recorded, i.e. not deleted via a handle.

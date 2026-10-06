@@ -4,6 +4,7 @@ use tracing::warn;
 
 use super::codec::Codec;
 use super::queue::Queue;
+use super::session::{ConsumerRegistration, session_after};
 use crate::client::channel::Channel;
 use crate::client::consumer::{CancellationReason, Consumer};
 use crate::client::message::DeliverMessage;
@@ -47,6 +48,8 @@ pub struct TypedConsumer<T, C: Codec> {
     _channel: Channel,
     /// The session generation `inner` consumes on.
     generation: u64,
+    /// With recovery on, counts this consumer as recovery demand.
+    _registration: Option<ConsumerRegistration>,
     queue: Queue<C>,
     opts: SubscribeOpts,
     _phantom: PhantomData<T>,
@@ -57,6 +60,7 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
         inner: Consumer,
         channel: Channel,
         generation: u64,
+        registration: Option<ConsumerRegistration>,
         queue: Queue<C>,
         opts: SubscribeOpts,
     ) -> Self {
@@ -64,6 +68,7 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
             inner,
             _channel: channel,
             generation,
+            _registration: registration,
             queue,
             opts,
             _phantom: PhantomData,
@@ -116,10 +121,12 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
 }
 
 impl<T, C: Codec> TypedConsumer<T, C> {
-    /// Consumer-level recovery after `ChannelClosed` / `ServerCancel`, when
-    /// the client has recovery on. Retries every `RecoveryConfig::timeout`
-    /// until it consumes again; gives up if the queue was deleted through its
-    /// handle or the connection is gone. Returns whether it recovered.
+    /// Recovery, when the client has it on. After `ChannelClosed` /
+    /// `ServerCancel` it consumes again on the current session; after
+    /// `ConnectionClosed` it first waits, unbounded, for a newer session. A
+    /// failed attempt is retried after `RecoveryConfig::timeout`. Gives up if
+    /// the queue was deleted through its handle or the client is dropped.
+    /// Returns whether it recovered.
     async fn recover(&mut self) -> bool {
         let Some(timeout) = self
             .queue
@@ -129,18 +136,26 @@ impl<T, C: Codec> TypedConsumer<T, C> {
         else {
             return false;
         };
-        if !matches!(
-            self.inner.cancellation(),
-            Some(CancellationReason::ChannelClosed { .. } | CancellationReason::ServerCancel)
-        ) {
-            return false;
-        }
+        let mut lost_generation = match self.inner.cancellation() {
+            Some(CancellationReason::ConnectionClosed { .. }) => Some(self.generation),
+            Some(CancellationReason::ChannelClosed { .. } | CancellationReason::ServerCancel) => {
+                None
+            }
+            None => return false,
+        };
         while self.queue.is_recorded() {
-            let Ok(client) = self.queue.client() else {
-                return false;
+            let session = match lost_generation {
+                Some(generation) => {
+                    match session_after(self.queue.weak_client(), generation, None).await {
+                        Ok(session) => session,
+                        Err(_) => return false,
+                    }
+                }
+                None => match self.queue.client() {
+                    Ok(client) => client.current(),
+                    Err(_) => return false,
+                },
             };
-            let session = client.current();
-            drop(client);
             match self.queue.redeclare_and_consume(&session, &self.opts).await {
                 Ok((channel, consumer)) => {
                     self.inner = consumer;
@@ -148,7 +163,7 @@ impl<T, C: Codec> TypedConsumer<T, C> {
                     self.generation = session.generation;
                     return true;
                 }
-                Err(Error::ConnectionClosed { .. }) => return false,
+                Err(Error::ConnectionClosed { .. }) => lost_generation = Some(session.generation),
                 Err(e) => {
                     warn!(error = %e, "consumer recovery failed, retrying");
                     tokio::time::sleep(timeout).await;

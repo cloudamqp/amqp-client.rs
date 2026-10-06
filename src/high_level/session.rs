@@ -1,7 +1,12 @@
-//! The `Client`'s current AMQP session and the state shared with its handles.
+//! The `Client`'s current AMQP session, and operation-driven recovery of it
+//! (ADR-0002).
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use tokio::sync::watch;
+use tracing::{info, warn};
 
 use super::recovery::RecoveryConfig;
 use super::topology::Topology;
@@ -18,14 +23,23 @@ pub(crate) struct Session {
     pub(crate) channel: Arc<Channel>,
 }
 
-/// State owned by the `Client`; handles and consumers hold it weakly, so
-/// dropping the `Client` ends them.
+/// The session slot. `waiters` and `consumers` are the recovery demand.
+struct Slot {
+    session: Arc<Session>,
+    recovering: bool,
+    waiters: usize,
+    consumers: usize,
+}
+
+/// State owned by the `Client`; handles, consumers and the recovery task hold
+/// it weakly, so dropping the `Client` ends them.
 pub(crate) struct ClientInner {
-    #[allow(dead_code, reason = "used to reconnect once session recovery lands")]
     config: Config,
     recovery: Option<RecoveryConfig>,
     pub(crate) topology: Arc<Mutex<Topology>>,
-    session: Mutex<Arc<Session>>,
+    slot: Mutex<Slot>,
+    /// Announces each new session generation.
+    generation_tx: watch::Sender<u64>,
 }
 
 impl ClientInner {
@@ -33,12 +47,19 @@ impl ClientInner {
         config: Config,
         recovery: Option<RecoveryConfig>,
     ) -> Result<Arc<Self>, Error> {
-        let session = open_session(&config, 0).await?;
+        let topology = Arc::default();
+        let session = open_session(&config, &topology, 0).await?;
         Ok(Arc::new(Self {
             config,
             recovery,
-            topology: Arc::default(),
-            session: Mutex::new(Arc::new(session)),
+            topology,
+            slot: Mutex::new(Slot {
+                session: Arc::new(session),
+                recovering: false,
+                waiters: 0,
+                consumers: 0,
+            }),
+            generation_tx: watch::channel(0).0,
         }))
     }
 
@@ -47,25 +68,203 @@ impl ClientInner {
     }
 
     pub(crate) fn current(&self) -> Arc<Session> {
-        self.session.lock().unwrap().clone()
+        self.slot.lock().unwrap().session.clone()
     }
 
-    /// Runs `op` on the current session.
-    pub(crate) async fn with_session<R, F, Fut>(&self, op: F) -> Result<R, Error>
+    /// Runs `op` on a usable session. With recovery on, it first waits (at
+    /// most the recovery timeout) for recovery in progress, and if `op` finds
+    /// the session lost, triggers recovery, waits for it the same way and runs
+    /// `op` once more.
+    pub(crate) async fn with_session<R, F, Fut>(self: &Arc<Self>, op: F) -> Result<R, Error>
     where
         F: Fn(Arc<Session>) -> Fut,
         Fut: Future<Output = Result<R, Error>>,
     {
-        op(self.current()).await
+        let Some(timeout) = self.recovery.as_ref().map(|r| r.timeout) else {
+            return op(self.current()).await;
+        };
+        let session = {
+            let slot = self.slot.lock().unwrap();
+            (!slot.recovering).then(|| slot.session.clone())
+        };
+        let session = match session {
+            Some(session) => session,
+            None => {
+                let generation = self.current().generation;
+                session_after(Arc::downgrade(self), generation, Some(timeout)).await?
+            }
+        };
+        match op(session.clone()).await {
+            Err(Error::ConnectionClosed { .. }) => {
+                let next =
+                    session_after(Arc::downgrade(self), session.generation, Some(timeout)).await?;
+                op(next).await
+            }
+            result => result,
+        }
+    }
+
+    /// Counts a live recoverable consumer as recovery demand until the
+    /// returned guard is dropped.
+    pub(crate) fn register_consumer(self: &Arc<Self>) -> ConsumerRegistration {
+        self.slot.lock().unwrap().consumers += 1;
+        ConsumerRegistration {
+            client: Arc::downgrade(self),
+        }
     }
 }
 
-async fn open_session(config: &Config, generation: u64) -> Result<Session, Error> {
+/// Waits for a session newer than `generation`, triggering recovery if it is
+/// not running. Gives up after `timeout` (if any) or when the client is
+/// dropped. Holds the client only weakly while waiting.
+pub(crate) async fn session_after(
+    client: Weak<ClientInner>,
+    generation: u64,
+    timeout: Option<Duration>,
+) -> Result<Arc<Session>, Error> {
+    let mut generations = {
+        let inner = client.upgrade().ok_or_else(client_dropped)?;
+        inner.slot.lock().unwrap().waiters += 1;
+        inner.generation_tx.subscribe()
+    };
+    let _waiter = Waiter(client.clone());
+    let wait = async {
+        loop {
+            {
+                let inner = client.upgrade().ok_or_else(client_dropped)?;
+                let mut slot = inner.slot.lock().unwrap();
+                if slot.session.generation > generation {
+                    return Ok(slot.session.clone());
+                }
+                if !slot.recovering {
+                    slot.recovering = true;
+                    tokio::spawn(recover(client.clone()));
+                }
+            }
+            if generations.changed().await.is_err() {
+                return Err(client_dropped());
+            }
+        }
+    };
+    match timeout {
+        Some(t) => tokio::time::timeout(t, wait)
+            .await
+            .unwrap_or_else(|_| Err(session_lost())),
+        None => wait.await,
+    }
+}
+
+/// The recovery task: connect, declare the recorded topology, install the new
+/// generation; on failure wait the recovery timeout and retry. Stands down when
+/// demand reaches zero or the client is dropped.
+async fn recover(client: Weak<ClientInner>) {
+    loop {
+        let Some(inner) = client.upgrade() else {
+            return;
+        };
+        let generation = {
+            let mut slot = inner.slot.lock().unwrap();
+            if slot.waiters == 0 && slot.consumers == 0 {
+                slot.recovering = false;
+                return;
+            }
+            slot.session.generation + 1
+        };
+        let timeout = inner
+            .recovery
+            .as_ref()
+            .map_or(Duration::ZERO, |r| r.timeout);
+        match open_session(&inner.config, &inner.topology, generation).await {
+            Ok(session) => {
+                {
+                    let mut slot = inner.slot.lock().unwrap();
+                    slot.session = Arc::new(session);
+                    slot.recovering = false;
+                }
+                inner.generation_tx.send_replace(generation);
+                info!(generation, "AMQP session recovered");
+                return;
+            }
+            Err(e) => warn!(error = %e, "session recovery failed, retrying"),
+        }
+        drop(inner);
+        tokio::time::sleep(timeout).await;
+    }
+}
+
+/// Connects and declares the recorded topology: exchanges, then queues
+/// (following renames of server-named queues), then bindings.
+async fn open_session(
+    config: &Config,
+    topology: &Mutex<Topology>,
+    generation: u64,
+) -> Result<Session, Error> {
     let connection = Connection::connect_with_config(config.clone()).await?;
     let channel = Arc::new(connection.open_channel().await?);
+    let (exchanges, queues) = {
+        let t = topology.lock().unwrap();
+        (t.exchanges().to_vec(), t.queues().to_vec())
+    };
+    for e in exchanges {
+        channel.exchange_declare(&e.name, &e.kind, e.opts).await?;
+    }
+    for q in queues {
+        let ok = channel.queue_declare(&q.requested_name, q.opts).await?;
+        topology.lock().unwrap().rename_queue(q.id, &ok.queue);
+    }
+    let bindings: Vec<_> = {
+        let t = topology.lock().unwrap();
+        t.bindings()
+            .iter()
+            .filter_map(|b| Some((t.queue_name(b.queue)?.to_owned(), b.clone())))
+            .collect()
+    };
+    for (queue, b) in bindings {
+        channel
+            .queue_bind(&queue, &b.exchange, &b.routing_key, b.arguments)
+            .await?;
+    }
     Ok(Session {
         generation,
         connection,
         channel,
     })
+}
+
+/// Decrements the waiter count on drop, including on timeout or cancel.
+struct Waiter(Weak<ClientInner>);
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.slot.lock().unwrap().waiters -= 1;
+        }
+    }
+}
+
+/// Keeps a recoverable consumer counted as recovery demand.
+pub(crate) struct ConsumerRegistration {
+    client: Weak<ClientInner>,
+}
+
+impl Drop for ConsumerRegistration {
+    fn drop(&mut self) {
+        if let Some(inner) = self.client.upgrade() {
+            inner.slot.lock().unwrap().consumers -= 1;
+        }
+    }
+}
+
+fn client_dropped() -> Error {
+    Error::ConnectionClosed {
+        code: 0,
+        reason: "client dropped".into(),
+    }
+}
+
+fn session_lost() -> Error {
+    Error::ConnectionClosed {
+        code: 0,
+        reason: "connection lost; recovery did not finish in time".into(),
+    }
 }
