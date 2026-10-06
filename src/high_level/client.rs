@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tracing::{debug, info};
 
@@ -6,10 +6,9 @@ use super::codec::{ByteCodec, Codec};
 use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
 use super::recovery::RecoveryConfig;
-use super::topology::Topology;
+use super::session::ClientInner;
 use crate::client::channel::{Channel, ExchangeDeclareOpts, QueueDeclareOpts};
 use crate::client::config::Config;
-use crate::client::connection::Connection;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
 use crate::protocol::types::ShortStr;
@@ -31,12 +30,9 @@ use crate::protocol::types::ShortStr;
 /// Use [`Client::builder`] to create a new client.
 pub struct Client<C: Codec = ByteCodec> {
     codec: Arc<C>,
-    /// The only strong reference: dropping the `Client` closes the connection,
-    /// ending every consumer.
-    connection: Arc<Connection>,
-    channel: Arc<Channel>,
-    topology: Arc<Mutex<Topology>>,
-    recovery: Option<RecoveryConfig>,
+    /// The only strong reference: dropping the `Client` closes the
+    /// connection, ending every consumer.
+    inner: Arc<ClientInner>,
 }
 
 impl Client<ByteCodec> {
@@ -56,12 +52,13 @@ impl Client<ByteCodec> {
 }
 
 impl<C: Codec> Client<C> {
-    /// Returns a clone of the underlying `Arc<Channel>`.
+    /// Returns the current session's channel.
     ///
     /// Useful for low-level operations the high-level API doesn't surface
-    /// (e.g. `queue_delete`, `queue_purge`, transactions).
+    /// (e.g. `queue_purge`, transactions). It is session-bound: nothing
+    /// declared through it is recorded, and it is not restored by recovery.
     pub fn channel(&self) -> Arc<Channel> {
-        self.channel.clone()
+        self.inner.current().channel.clone()
     }
 
     /// Declare an exchange and record it, so it is declared again after
@@ -72,13 +69,18 @@ impl<C: Codec> Client<C> {
         kind: ExchangeKind,
         opts: ExchangeDeclareOpts,
     ) -> Result<Exchange, Error> {
-        self.channel
-            .exchange_declare(name, kind.as_str(), opts.clone())
+        let kind = kind.as_str();
+        self.inner
+            .with_session(|s| {
+                let opts = opts.clone();
+                async move { s.channel.exchange_declare(name, kind, opts).await }
+            })
             .await?;
-        self.topology
+        self.inner
+            .topology
             .lock()
             .unwrap()
-            .record_exchange(name, kind.as_str(), opts);
+            .record_exchange(name, kind, opts);
         Ok(Exchange::new(name))
     }
 
@@ -105,20 +107,20 @@ impl<C: Codec> Client<C> {
     /// Declare a queue and record it, so it is declared again after recovery.
     /// An empty `name` lets the broker name the queue.
     pub async fn queue(&self, name: &str, opts: QueueDeclareOpts) -> Result<Queue<C>, Error> {
-        let ok = self.channel.queue_declare(name, opts.clone()).await?;
+        let ok = self
+            .inner
+            .with_session(|s| {
+                let opts = opts.clone();
+                async move { s.channel.queue_declare(name, opts).await }
+            })
+            .await?;
         let id = self
+            .inner
             .topology
             .lock()
             .unwrap()
             .record_queue(name, &ok.queue, opts);
-        Ok(Queue::new(
-            id,
-            self.topology.clone(),
-            self.channel.clone(),
-            Arc::downgrade(&self.connection),
-            self.codec.clone(),
-            self.recovery.clone(),
-        ))
+        Ok(Queue::new(id, &self.inner, self.codec.clone()))
     }
 
     /// Publish a serialized message to an exchange with the given routing key.
@@ -162,8 +164,15 @@ impl<C: Codec> Client<C> {
         props: BasicProperties,
     ) -> Result<(), Error> {
         let encoded = self.codec.encode(body)?;
-        self.channel
-            .basic_publish(exchange, routing_key, encoded, props)
+        self.inner
+            .with_session(|s| {
+                let (encoded, props) = (encoded.clone(), props.clone());
+                async move {
+                    s.channel
+                        .basic_publish(exchange, routing_key, encoded, props)
+                        .await
+                }
+            })
             .await
     }
 }
@@ -204,16 +213,12 @@ impl<C: Codec> ClientBuilder<C> {
     /// retry should wrap this call in their own loop.
     pub async fn build(self) -> Result<Client<C>, Error> {
         debug!("connecting to AMQP broker");
-        let connection = Connection::connect_with_config(self.config).await?;
-        let channel = Arc::new(connection.open_channel().await?);
+        let inner = ClientInner::connect(self.config, self.recovery).await?;
         info!("connected to AMQP broker");
 
         Ok(Client {
             codec: self.codec,
-            connection: Arc::new(connection),
-            channel,
-            topology: Arc::default(),
-            recovery: self.recovery,
+            inner,
         })
     }
 }

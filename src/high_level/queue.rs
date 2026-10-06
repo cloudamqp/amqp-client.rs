@@ -2,10 +2,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::codec::{ByteCodec, Codec};
 use super::consumer::{SubscribeOpts, TypedConsumer};
-use super::recovery::RecoveryConfig;
+use super::session::{ClientInner, Session};
 use super::topology::{QueueId, RecordedQueue, Topology};
 use crate::client::channel::{Channel, ConsumeOpts, QueueDeclareOpts, QueueDeleteOpts};
-use crate::client::connection::Connection;
 use crate::client::consumer::Consumer;
 use crate::error::Error;
 use crate::protocol::table::Table;
@@ -15,12 +14,9 @@ use crate::protocol::table::Table;
 pub struct Queue<C: Codec = ByteCodec> {
     id: QueueId,
     topology: Arc<Mutex<Topology>>,
-    channel: Arc<Channel>,
-    /// Weak, so queue handles and consumers never keep the connection alive
-    /// after the `Client` is dropped.
-    connection: Weak<Connection>,
+    /// Weak, so queue handles and consumers never keep the client alive.
+    client: Weak<ClientInner>,
     codec: Arc<C>,
-    recovery: Option<RecoveryConfig>,
 }
 
 impl<C: Codec> Clone for Queue<C> {
@@ -28,30 +24,19 @@ impl<C: Codec> Clone for Queue<C> {
         Self {
             id: self.id,
             topology: self.topology.clone(),
-            channel: self.channel.clone(),
-            connection: self.connection.clone(),
+            client: self.client.clone(),
             codec: self.codec.clone(),
-            recovery: self.recovery.clone(),
         }
     }
 }
 
 impl<C: Codec> Queue<C> {
-    pub(crate) fn new(
-        id: QueueId,
-        topology: Arc<Mutex<Topology>>,
-        channel: Arc<Channel>,
-        connection: Weak<Connection>,
-        codec: Arc<C>,
-        recovery: Option<RecoveryConfig>,
-    ) -> Self {
+    pub(crate) fn new(id: QueueId, client: &Arc<ClientInner>, codec: Arc<C>) -> Self {
         Self {
             id,
-            topology,
-            channel,
-            connection,
+            topology: client.topology.clone(),
+            client: Arc::downgrade(client),
             codec,
-            recovery,
         }
     }
 
@@ -83,8 +68,15 @@ impl<C: Codec> Queue<C> {
         arguments: Table,
     ) -> Result<(), Error> {
         let exchange = exchange.as_ref();
-        self.channel
-            .queue_bind(&self.name(), exchange, routing_key, arguments.clone())
+        self.client()?
+            .with_session(|s| {
+                let (name, arguments) = (self.name(), arguments.clone());
+                async move {
+                    s.channel
+                        .queue_bind(&name, exchange, routing_key, arguments)
+                        .await
+                }
+            })
             .await?;
         self.topology
             .lock()
@@ -99,15 +91,31 @@ impl<C: Codec> Queue<C> {
         &self,
         opts: SubscribeOpts,
     ) -> Result<TypedConsumer<T, C>, Error> {
-        let channel = self.open_channel().await?;
-        let consumer = self.consume_on(&channel, &self.name(), &opts).await?;
-        Ok(TypedConsumer::new(consumer, channel, self.clone(), opts))
+        let (generation, channel, consumer) = self
+            .client()?
+            .with_session(|s| {
+                let (name, opts) = (self.name(), opts.clone());
+                async move {
+                    let channel = s.connection.open_channel().await?;
+                    let consumer = consume_on(&channel, &name, &opts).await?;
+                    Ok((s.generation, channel, consumer))
+                }
+            })
+            .await?;
+        Ok(TypedConsumer::new(
+            consumer,
+            channel,
+            generation,
+            self.clone(),
+            opts,
+        ))
     }
 
-    /// Consumer-level recovery: on a new channel, declare the queue and its
-    /// bindings again, then consume.
+    /// Consumer-level recovery: on a new channel of `session`, declare the
+    /// queue and its bindings again, then consume.
     pub(crate) async fn redeclare_and_consume(
         &self,
+        session: &Session,
         opts: &SubscribeOpts,
     ) -> Result<(Channel, Consumer), Error> {
         let (queue, bindings) = {
@@ -121,21 +129,25 @@ impl<C: Codec> Queue<C> {
             let bindings: Vec<_> = topology.bindings_for(self.id).cloned().collect();
             (queue, bindings)
         };
-        let (channel, name) = self.ensure_declared(queue).await?;
+        let (channel, name) = self.ensure_declared(session, queue).await?;
         for b in bindings {
             channel
                 .queue_bind(&name, &b.exchange, &b.routing_key, b.arguments)
                 .await?;
         }
-        let consumer = self.consume_on(&channel, &name, opts).await?;
+        let consumer = consume_on(&channel, &name, opts).await?;
         Ok((channel, consumer))
     }
 
     /// Declares the queue again on a new channel. A server-named queue keeps
     /// its name while it still exists; if the broker deleted it, it is
     /// declared anew and gets a new name.
-    async fn ensure_declared(&self, queue: RecordedQueue) -> Result<(Channel, String), Error> {
-        let mut channel = self.open_channel().await?;
+    async fn ensure_declared(
+        &self,
+        session: &Session,
+        queue: RecordedQueue,
+    ) -> Result<(Channel, String), Error> {
+        let mut channel = session.connection.open_channel().await?;
         if queue.requested_name.is_empty() {
             let passive = QueueDeclareOpts {
                 passive: true,
@@ -145,7 +157,7 @@ impl<C: Codec> Queue<C> {
                 Ok(_) => return Ok((channel, queue.name)),
                 // The failed passive declare closed the channel.
                 Err(Error::ChannelClosed { code: 404, .. }) => {
-                    channel = self.open_channel().await?;
+                    channel = session.connection.open_channel().await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -160,38 +172,16 @@ impl<C: Codec> Queue<C> {
         Ok((channel, ok.queue))
     }
 
-    async fn open_channel(&self) -> Result<Channel, Error> {
-        let connection = self.connection.upgrade().ok_or(Error::ConnectionClosed {
+    pub(crate) fn client(&self) -> Result<Arc<ClientInner>, Error> {
+        self.client.upgrade().ok_or(Error::ConnectionClosed {
             code: 0,
             reason: "client dropped".into(),
-        })?;
-        connection.open_channel().await
-    }
-
-    async fn consume_on(
-        &self,
-        channel: &Channel,
-        name: &str,
-        opts: &SubscribeOpts,
-    ) -> Result<Consumer, Error> {
-        channel.basic_qos(opts.prefetch, false).await?;
-        let consume = ConsumeOpts {
-            no_local: false,
-            no_ack: opts.no_ack,
-            exclusive: opts.exclusive,
-            arguments: opts.arguments.clone(),
-        };
-        let tag = opts.consumer_tag.as_deref().unwrap_or("");
-        channel.basic_consume(name, tag, consume).await
+        })
     }
 
     /// Whether the queue is still recorded, i.e. not deleted via a handle.
     pub(crate) fn is_recorded(&self) -> bool {
         self.topology.lock().unwrap().queue(self.id).is_some()
-    }
-
-    pub(crate) fn recovery(&self) -> Option<&RecoveryConfig> {
-        self.recovery.as_ref()
     }
 
     pub(crate) fn codec(&self) -> &C {
@@ -202,7 +192,13 @@ impl<C: Codec> Queue<C> {
     /// declare it again. Its consumers end. Returns the number of messages
     /// deleted.
     pub async fn delete(&self, opts: QueueDeleteOpts) -> Result<u32, Error> {
-        let count = self.channel.queue_delete(&self.name(), opts).await?;
+        let count = self
+            .client()?
+            .with_session(|s| {
+                let (name, opts) = (self.name(), opts.clone());
+                async move { s.channel.queue_delete(&name, opts).await }
+            })
+            .await?;
         self.topology.lock().unwrap().forget_queue(self.id);
         Ok(count)
     }
@@ -221,8 +217,15 @@ impl<C: Codec> Queue<C> {
         arguments: Table,
     ) -> Result<(), Error> {
         let exchange = exchange.as_ref();
-        self.channel
-            .queue_unbind(&self.name(), exchange, routing_key, arguments.clone())
+        self.client()?
+            .with_session(|s| {
+                let (name, arguments) = (self.name(), arguments.clone());
+                async move {
+                    s.channel
+                        .queue_unbind(&name, exchange, routing_key, arguments)
+                        .await
+                }
+            })
             .await?;
         self.topology
             .lock()
@@ -230,6 +233,23 @@ impl<C: Codec> Queue<C> {
             .forget_binding(self.id, exchange, routing_key, &arguments);
         Ok(())
     }
+}
+
+/// Sets prefetch on `channel` and starts consuming `name`.
+async fn consume_on(
+    channel: &Channel,
+    name: &str,
+    opts: &SubscribeOpts,
+) -> Result<Consumer, Error> {
+    channel.basic_qos(opts.prefetch, false).await?;
+    let consume = ConsumeOpts {
+        no_local: false,
+        no_ack: opts.no_ack,
+        exclusive: opts.exclusive,
+        arguments: opts.arguments.clone(),
+    };
+    let tag = opts.consumer_tag.as_deref().unwrap_or("");
+    channel.basic_consume(name, tag, consume).await
 }
 
 impl<C: Codec> std::fmt::Debug for Queue<C> {

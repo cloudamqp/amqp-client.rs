@@ -4,6 +4,7 @@ pub mod consumer;
 pub mod exchange;
 pub mod queue;
 pub mod recovery;
+mod session;
 mod topology;
 
 pub use client::{Client, ClientBuilder};

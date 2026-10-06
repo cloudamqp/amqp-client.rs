@@ -45,6 +45,8 @@ pub struct TypedConsumer<T, C: Codec> {
     inner: Consumer,
     /// Owned so the consumer's channel lives exactly as long as it does.
     _channel: Channel,
+    /// The session generation `inner` consumes on.
+    generation: u64,
     queue: Queue<C>,
     opts: SubscribeOpts,
     _phantom: PhantomData<T>,
@@ -54,12 +56,14 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
     pub(crate) fn new(
         inner: Consumer,
         channel: Channel,
+        generation: u64,
         queue: Queue<C>,
         opts: SubscribeOpts,
     ) -> Self {
         Self {
             inner,
             _channel: channel,
+            generation,
             queue,
             opts,
             _phantom: PhantomData,
@@ -117,7 +121,12 @@ impl<T, C: Codec> TypedConsumer<T, C> {
     /// until it consumes again; gives up if the queue was deleted through its
     /// handle or the connection is gone. Returns whether it recovered.
     async fn recover(&mut self) -> bool {
-        let Some(timeout) = self.queue.recovery().map(|r| r.timeout) else {
+        let Some(timeout) = self
+            .queue
+            .client()
+            .ok()
+            .and_then(|c| c.recovery().map(|r| r.timeout))
+        else {
             return false;
         };
         if !matches!(
@@ -127,10 +136,16 @@ impl<T, C: Codec> TypedConsumer<T, C> {
             return false;
         }
         while self.queue.is_recorded() {
-            match self.queue.redeclare_and_consume(&self.opts).await {
+            let Ok(client) = self.queue.client() else {
+                return false;
+            };
+            let session = client.current();
+            drop(client);
+            match self.queue.redeclare_and_consume(&session, &self.opts).await {
                 Ok((channel, consumer)) => {
                     self.inner = consumer;
                     self._channel = channel;
+                    self.generation = session.generation;
                     return true;
                 }
                 Err(Error::ConnectionClosed { .. }) => return false,
