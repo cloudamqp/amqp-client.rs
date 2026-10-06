@@ -152,6 +152,7 @@ mod tests {
             publish_admission: Arc::new(Semaphore::new(1)),
             publish_admission_capacity: 1,
             id_alloc: Mutex::new(ChannelIdAllocator::new(1)),
+            dead: tokio::sync::Notify::new(),
         });
         (MessageHandle::new(7, shared), rx)
     }

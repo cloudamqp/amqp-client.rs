@@ -534,3 +534,37 @@ async fn consumer_ends_when_the_connection_is_dropped_or_closed() {
         );
     }
 }
+
+/// A peer that goes silent without closing the socket is detected by the
+/// heartbeat: the connection ends, and so do its consumers.
+#[tokio::test]
+async fn heartbeat_timeout_ends_the_connection() {
+    let proxy = support::proxy::Proxy::start().await;
+    let mut config = amqp_client_rs::Config::from_uri(&proxy.uri()).unwrap();
+    config.heartbeat = 1;
+    let conn = Connection::connect_with_config(config).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    let ok = ch
+        .queue_declare(
+            "",
+            QueueDeclareOpts {
+                exclusive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut consumer = ch
+        .basic_consume(&ok.queue, "", ConsumeOpts::default())
+        .await
+        .unwrap();
+
+    proxy.freeze();
+
+    let ended = tokio::time::timeout(Duration::from_secs(6), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+    assert!(matches!(
+        ch.queue_declare("", QueueDeclareOpts::default()).await,
+        Err(amqp_client_rs::Error::ConnectionClosed { .. })
+    ));
+}

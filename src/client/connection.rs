@@ -116,6 +116,9 @@ pub(crate) struct ConnectionShared {
     pub(crate) publish_admission_capacity: usize,
     /// Channel-ID allocator, shared with every channel and the reader task.
     pub(crate) id_alloc: Mutex<ChannelIdAllocator>,
+    /// Notified when the peer is considered dead (heartbeat timeout); stops
+    /// the reader task.
+    pub(crate) dead: tokio::sync::Notify,
 }
 
 impl ConnectionShared {
@@ -414,6 +417,7 @@ impl Connection {
             publish_admission,
             publish_admission_capacity,
             id_alloc,
+            dead: tokio::sync::Notify::new(),
         });
 
         // Channel registry shared between Connection and reader task
@@ -934,7 +938,14 @@ async fn reader_loop(
         if buf.capacity() - buf.len() < 64 * 1024 {
             buf.reserve(256 * 1024);
         }
-        match read_half.read_buf(&mut buf).await {
+        let read = tokio::select! {
+            read = read_half.read_buf(&mut buf) => read,
+            () = shared.dead.notified() => {
+                debug!("reader stopped: peer considered dead");
+                return;
+            }
+        };
+        match read {
             Ok(0) => {
                 debug!("connection closed by peer");
                 return;
@@ -981,6 +992,10 @@ async fn heartbeat_loop(
                 timeout_secs = timeout.as_secs(),
                 "heartbeat timeout: no data received from peer"
             );
+            // End the connection: stop the reader (which ends every channel)
+            // and the writer.
+            shared.dead.notify_one();
+            let _ = shared.frame_tx.send(OutgoingFrame::Shutdown);
             break;
         }
     }
