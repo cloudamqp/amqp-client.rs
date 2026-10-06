@@ -1,3 +1,5 @@
+mod support;
+
 use std::time::Duration;
 
 use amqp_client_rs::{
@@ -464,4 +466,71 @@ async fn reopen_after_broker_closed_a_channel() {
         .expect("open_channel hung")
         .unwrap();
     ch.exchange_delete(&name, false).await.unwrap();
+}
+
+/// When the connection drops, a consumer's stream ends with a
+/// `ConnectionClosed` cancellation instead of hanging.
+#[tokio::test]
+async fn consumer_ends_when_the_connection_drops() {
+    let proxy = support::proxy::Proxy::start().await;
+    let conn = Connection::connect(&proxy.uri()).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    let ok = ch
+        .queue_declare(
+            "",
+            QueueDeclareOpts {
+                exclusive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut consumer = ch
+        .basic_consume(&ok.queue, "", ConsumeOpts::default())
+        .await
+        .unwrap();
+
+    proxy.cut();
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+    assert!(matches!(
+        consumer.cancellation(),
+        Some(amqp_client_rs::CancellationReason::ConnectionClosed { .. })
+    ));
+}
+
+/// Dropping or closing the `Connection` ends its consumers too.
+#[tokio::test]
+async fn consumer_ends_when_the_connection_is_dropped_or_closed() {
+    for close in [false, true] {
+        let conn = Connection::connect(AMQP_URI).await.unwrap();
+        let ch = conn.open_channel().await.unwrap();
+        let ok = ch
+            .queue_declare(
+                "",
+                QueueDeclareOpts {
+                    exclusive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut consumer = ch
+            .basic_consume(&ok.queue, "", ConsumeOpts::default())
+            .await
+            .unwrap();
+
+        if close {
+            conn.close().await.unwrap();
+        } else {
+            drop(conn);
+        }
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+        assert!(
+            matches!(ended, Ok(None)),
+            "consumer did not end (close: {close})"
+        );
+    }
 }

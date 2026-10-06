@@ -434,15 +434,22 @@ impl Connection {
         let reader_senders = channel_senders.clone();
         let reader_shared = shared.clone();
         let reader_last_recv = last_recv.clone();
-        let reader_task = tokio::spawn(reader_loop(
-            read_half,
-            reader_senders,
-            conn_tx,
-            reader_shared,
-            reader_last_recv,
-            conn_start,
-            post_tune_cap,
-        ));
+        let reader_task = tokio::spawn(async move {
+            reader_loop(
+                read_half,
+                reader_senders.clone(),
+                conn_tx,
+                reader_shared,
+                reader_last_recv,
+                conn_start,
+                post_tune_cap,
+            )
+            .await;
+            // The connection is gone: dropping every channel's sender ends
+            // its dispatch task, which ends its consumers with
+            // `ConnectionClosed`.
+            reader_senders.lock().unwrap().clear();
+        });
 
         // Spawn heartbeat task if enabled
         let heartbeat_task = if heartbeat > 0 {
@@ -620,6 +627,9 @@ impl Drop for Connection {
             let _ = self.shared.frame_tx.send(OutgoingFrame::Shutdown);
         }
         self.reader_task.abort();
+        // Aborting the reader skips its cleanup: end every channel here, so
+        // their consumers end with `ConnectionClosed`.
+        self.channel_senders.lock().unwrap().clear();
         if let Some(ref hb) = self.heartbeat_task {
             hb.abort();
         }
