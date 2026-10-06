@@ -678,3 +678,48 @@ async fn publish_confirmed_reports_a_nack() {
     let second = client.publish_confirmed("", &q.name(), &greeting(2)).await;
     assert!(matches!(second, Err(Error::PublishNacked)), "{second:?}");
 }
+
+/// Deleting a queue while its consumer is waiting in `next()` must not let
+/// consumer recovery declare it again.
+#[tokio::test]
+async fn queue_delete_while_the_consumer_is_polled() {
+    for i in 0..5 {
+        let client = recovering_json_client().await;
+        let name = queue_name(&format!("delete-polled-{i}"));
+        let q = client
+            .queue(&name, QueueDeclareOpts::default())
+            .await
+            .unwrap();
+        let mut consumer = q
+            .subscribe::<Greeting>(SubscribeOpts::default())
+            .await
+            .unwrap();
+        let next = tokio::spawn(async move { consumer.next().await.is_none() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        q.delete(QueueDeleteOpts::default()).await.unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(2), next).await;
+        let conn = Connection::connect(AMQP_URI).await.unwrap();
+        let passive = QueueDeclareOpts {
+            passive: true,
+            ..Default::default()
+        };
+        let exists = conn
+            .open_channel()
+            .await
+            .unwrap()
+            .queue_declare(&name, passive)
+            .await
+            .is_ok();
+        if exists {
+            let ch = conn.open_channel().await.unwrap();
+            let _ = ch.queue_delete(&name, QueueDeleteOpts::default()).await;
+        }
+        assert!(!exists, "run {i}: deleted queue was declared again");
+        assert!(
+            matches!(ended, Ok(Ok(true))),
+            "run {i}: consumer did not end"
+        );
+    }
+}

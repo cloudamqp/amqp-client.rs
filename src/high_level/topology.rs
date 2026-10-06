@@ -31,6 +31,12 @@ pub(crate) struct RecordedBinding {
     pub(crate) arguments: Table,
 }
 
+/// A queue and its bindings taken out of the topology by `take_queue`.
+pub(crate) struct TakenQueue {
+    queue: RecordedQueue,
+    bindings: Vec<RecordedBinding>,
+}
+
 /// Recorded topology, listed in the order it is declared again on recovery.
 #[derive(Default)]
 pub(crate) struct Topology {
@@ -95,9 +101,21 @@ impl Topology {
         self.queue(id).map(|q| q.name.as_str())
     }
 
-    pub(crate) fn forget_queue(&mut self, id: QueueId) {
-        self.queues.retain(|q| q.id != id);
-        self.bindings.retain(|b| b.queue != id);
+    /// Forgets a queue and its bindings, returning them so a failed delete
+    /// can restore them.
+    pub(crate) fn take_queue(&mut self, id: QueueId) -> Option<TakenQueue> {
+        let index = self.queues.iter().position(|q| q.id == id)?;
+        let queue = self.queues.remove(index);
+        let (bindings, kept) = std::mem::take(&mut self.bindings)
+            .into_iter()
+            .partition(|b| b.queue == id);
+        self.bindings = kept;
+        Some(TakenQueue { queue, bindings })
+    }
+
+    pub(crate) fn restore_queue(&mut self, taken: TakenQueue) {
+        self.queues.push(taken.queue);
+        self.bindings.extend(taken.bindings);
     }
 
     pub(crate) fn record_binding(
@@ -253,13 +271,31 @@ mod tests {
     }
 
     #[test]
+    fn a_taken_queue_can_be_restored_with_its_bindings() {
+        let mut t = Topology::default();
+        let a = t.record_queue("a", "a", QueueDeclareOpts::default());
+        let b = t.record_queue("b", "b", QueueDeclareOpts::default());
+        t.record_binding(a, "ex", "ka", Table::default());
+        t.record_binding(b, "ex", "kb", Table::default());
+
+        let taken = t.take_queue(a).unwrap();
+        assert_eq!(t.queue_name(a), None);
+        assert!(binding_keys(&t, a).is_empty());
+
+        t.restore_queue(taken);
+        assert_eq!(t.queue_name(a), Some("a"));
+        assert_eq!(binding_keys(&t, a), [("ex", "ka")]);
+        assert_eq!(binding_keys(&t, b), [("ex", "kb")]);
+    }
+
+    #[test]
     fn deleting_a_queue_forgets_it_and_its_bindings() {
         let mut t = Topology::default();
         let a = t.record_queue("a", "a", QueueDeclareOpts::default());
         let b = t.record_queue("b", "b", QueueDeclareOpts::default());
         t.record_binding(a, "ex", "ka", Table::default());
         t.record_binding(b, "ex", "kb", Table::default());
-        t.forget_queue(a);
+        t.take_queue(a);
         assert_eq!(queue_names(&t), ["b"]);
         assert_eq!(t.queue_name(a), None);
         assert!(binding_keys(&t, a).is_empty());

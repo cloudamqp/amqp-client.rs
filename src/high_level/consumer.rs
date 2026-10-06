@@ -5,7 +5,7 @@ use tracing::warn;
 use super::codec::Codec;
 use super::queue::Queue;
 use super::session::{ConsumerRegistration, session_after};
-use crate::client::channel::Channel;
+use crate::client::channel::{Channel, QueueDeleteOpts};
 use crate::client::consumer::{CancellationReason, Consumer};
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
@@ -157,7 +157,16 @@ impl<T, C: Codec> TypedConsumer<T, C> {
                 },
             };
             match self.queue.redeclare_and_consume(&session, &self.opts).await {
-                Ok((channel, consumer)) => {
+                Ok((channel, consumer, name)) if !self.queue.is_recorded() => {
+                    // Deleted through its handle while we declared it again:
+                    // undo that and end.
+                    drop(consumer);
+                    let _ = channel
+                        .queue_delete(&name, QueueDeleteOpts::default())
+                        .await;
+                    return false;
+                }
+                Ok((channel, consumer, _)) => {
                     self.inner = consumer;
                     self._channel = channel;
                     self.generation = session.generation;

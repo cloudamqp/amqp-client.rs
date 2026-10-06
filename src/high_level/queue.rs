@@ -115,12 +115,12 @@ impl<C: Codec> Queue<C> {
 
     /// Consumer-level recovery: on a new channel of `session`, declare the
     /// queue, the recorded exchanges its bindings use, and its bindings
-    /// again, then consume.
+    /// again, then consume. Returns the name the queue was declared under.
     pub(crate) async fn redeclare_and_consume(
         &self,
         session: &Session,
         opts: &SubscribeOpts,
-    ) -> Result<(Channel, Consumer), Error> {
+    ) -> Result<(Channel, Consumer, String), Error> {
         let (queue, bindings, exchanges) = {
             let topology = self.topology.lock().unwrap();
             let Some(queue) = topology.queue(self.id).cloned() else {
@@ -150,7 +150,7 @@ impl<C: Codec> Queue<C> {
                 .await?;
         }
         let consumer = consume_on(&channel, &name, opts).await?;
-        Ok((channel, consumer))
+        Ok((channel, consumer, name))
     }
 
     /// Declares the queue again on a new channel. A server-named queue keeps
@@ -210,15 +210,24 @@ impl<C: Codec> Queue<C> {
     /// declare it again. Its consumers end. Returns the number of messages
     /// deleted.
     pub async fn delete(&self, opts: QueueDeleteOpts) -> Result<u32, Error> {
-        let count = self
-            .client()?
+        let client = self.client()?;
+        let name = self.name();
+        // Forget it first: the broker cancels the queue's consumers before it
+        // replies, and they must not see it as still recorded and declare it
+        // again.
+        let taken = self.topology.lock().unwrap().take_queue(self.id);
+        let result = client
             .with_session(|s| {
-                let (name, opts) = (self.name(), opts.clone());
+                let (name, opts) = (name.clone(), opts.clone());
                 async move { s.channel().queue_delete(&name, opts).await }
             })
-            .await?;
-        self.topology.lock().unwrap().forget_queue(self.id);
-        Ok(count)
+            .await;
+        if result.is_err()
+            && let Some(taken) = taken
+        {
+            self.topology.lock().unwrap().restore_queue(taken);
+        }
+        result
     }
 
     /// Remove a binding and forget it.
