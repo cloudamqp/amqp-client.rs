@@ -117,7 +117,7 @@ impl<C: Codec> Client<C> {
             .lock()
             .unwrap()
             .record_queue(name, &ok.queue, opts);
-        Ok(Queue::new(id, self.topology.clone()))
+        Ok(Queue::new(id, self.topology.clone(), self.channel.clone()))
     }
 
     /// Publish a serialized message to an exchange with the given routing key.

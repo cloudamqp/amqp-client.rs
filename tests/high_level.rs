@@ -329,3 +329,62 @@ async fn client_declares_a_server_named_queue() {
         .await
         .unwrap();
 }
+
+fn exclusive() -> QueueDeclareOpts {
+    QueueDeclareOpts {
+        exclusive: true,
+        ..Default::default()
+    }
+}
+
+async fn has_message(client: &Client, queue: &str) -> bool {
+    client
+        .channel()
+        .basic_get(queue, true)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// A binding routes messages from the exchange; unbinding stops that.
+#[tokio::test]
+async fn queue_binds_and_unbinds() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let ex = client
+        .topic(&queue_name("bind-ex"), ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let q = client.queue("", exclusive()).await.unwrap();
+
+    q.bind(&ex, "order.*").await.unwrap();
+    client
+        .publish(ex.name(), "order.new", &vec![1u8])
+        .await
+        .unwrap();
+    assert!(has_message(&client, &q.name()).await);
+
+    q.unbind(&ex, "order.*").await.unwrap();
+    client
+        .publish(ex.name(), "order.new", &vec![1u8])
+        .await
+        .unwrap();
+    assert!(!has_message(&client, &q.name()).await);
+
+    client
+        .channel()
+        .exchange_delete(ex.name(), false)
+        .await
+        .unwrap();
+}
+
+/// A queue can be bound to an exchange by name, e.g. a built-in one.
+#[tokio::test]
+async fn queue_binds_by_exchange_name() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let q = client.queue("", exclusive()).await.unwrap();
+    let key = queue_name("by-name");
+
+    q.bind("amq.topic", &key).await.unwrap();
+    client.publish("amq.topic", &key, &vec![1u8]).await.unwrap();
+    assert!(has_message(&client, &q.name()).await);
+}
