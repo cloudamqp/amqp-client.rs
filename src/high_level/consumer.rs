@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use tracing::warn;
 
 use super::codec::Codec;
+use super::queue::Queue;
 use crate::client::channel::Channel;
-use crate::client::consumer::Consumer;
+use crate::client::consumer::{CancellationReason, Consumer};
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
@@ -45,16 +45,23 @@ pub struct TypedConsumer<T, C: Codec> {
     inner: Consumer,
     /// Owned so the consumer's channel lives exactly as long as it does.
     _channel: Channel,
-    codec: Arc<C>,
+    queue: Queue<C>,
+    opts: SubscribeOpts,
     _phantom: PhantomData<T>,
 }
 
 impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
-    pub(crate) fn new(inner: Consumer, channel: Channel, codec: Arc<C>) -> Self {
+    pub(crate) fn new(
+        inner: Consumer,
+        channel: Channel,
+        queue: Queue<C>,
+        opts: SubscribeOpts,
+    ) -> Self {
         Self {
             inner,
             _channel: channel,
-            codec,
+            queue,
+            opts,
             _phantom: PhantomData,
         }
     }
@@ -72,8 +79,13 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
     /// consumer is closed.
     pub async fn next(&mut self) -> Option<TypedDelivery<T>> {
         loop {
-            let msg = self.inner.next().await?;
-            match self.codec.decode::<T>(&msg.body) {
+            let Some(msg) = self.inner.next().await else {
+                if self.recover().await {
+                    continue;
+                }
+                return None;
+            };
+            match self.queue.codec().decode::<T>(&msg.body) {
                 Ok(body) => {
                     return Some(TypedDelivery {
                         body,
@@ -96,6 +108,39 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
                 }
             }
         }
+    }
+}
+
+impl<T, C: Codec> TypedConsumer<T, C> {
+    /// Consumer-level recovery after `ChannelClosed` / `ServerCancel`, when
+    /// the client has recovery on. Retries every `RecoveryConfig::timeout`
+    /// until it consumes again; gives up if the queue was deleted through its
+    /// handle or the connection is gone. Returns whether it recovered.
+    async fn recover(&mut self) -> bool {
+        let Some(timeout) = self.queue.recovery().map(|r| r.timeout) else {
+            return false;
+        };
+        if !matches!(
+            self.inner.cancellation(),
+            Some(CancellationReason::ChannelClosed { .. } | CancellationReason::ServerCancel)
+        ) {
+            return false;
+        }
+        while self.queue.is_recorded() {
+            match self.queue.redeclare_and_consume(&self.opts).await {
+                Ok((channel, consumer)) => {
+                    self.inner = consumer;
+                    self._channel = channel;
+                    return true;
+                }
+                Err(Error::ConnectionClosed { .. }) => return false,
+                Err(e) => {
+                    warn!(error = %e, "consumer recovery failed, retrying");
+                    tokio::time::sleep(timeout).await;
+                }
+            }
+        }
+        false
     }
 }
 

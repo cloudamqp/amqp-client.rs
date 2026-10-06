@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex, Weak};
 use super::codec::{ByteCodec, Codec};
 use super::consumer::{SubscribeOpts, TypedConsumer};
 use super::recovery::RecoveryConfig;
-use super::topology::{QueueId, Topology};
-use crate::client::channel::{Channel, ConsumeOpts, QueueDeleteOpts};
+use super::topology::{QueueId, RecordedQueue, Topology};
+use crate::client::channel::{Channel, ConsumeOpts, QueueDeclareOpts, QueueDeleteOpts};
 use crate::client::connection::Connection;
+use crate::client::consumer::Consumer;
 use crate::error::Error;
 use crate::protocol::table::Table;
 
@@ -98,21 +99,103 @@ impl<C: Codec> Queue<C> {
         &self,
         opts: SubscribeOpts,
     ) -> Result<TypedConsumer<T, C>, Error> {
+        let channel = self.open_channel().await?;
+        let consumer = self.consume_on(&channel, &self.name(), &opts).await?;
+        Ok(TypedConsumer::new(consumer, channel, self.clone(), opts))
+    }
+
+    /// Consumer-level recovery: on a new channel, declare the queue and its
+    /// bindings again, then consume.
+    pub(crate) async fn redeclare_and_consume(
+        &self,
+        opts: &SubscribeOpts,
+    ) -> Result<(Channel, Consumer), Error> {
+        let (queue, bindings) = {
+            let topology = self.topology.lock().unwrap();
+            let Some(queue) = topology.queue(self.id).cloned() else {
+                return Err(Error::ConnectionClosed {
+                    code: 0,
+                    reason: "queue deleted".into(),
+                });
+            };
+            let bindings: Vec<_> = topology.bindings_for(self.id).cloned().collect();
+            (queue, bindings)
+        };
+        let (channel, name) = self.ensure_declared(queue).await?;
+        for b in bindings {
+            channel
+                .queue_bind(&name, &b.exchange, &b.routing_key, b.arguments)
+                .await?;
+        }
+        let consumer = self.consume_on(&channel, &name, opts).await?;
+        Ok((channel, consumer))
+    }
+
+    /// Declares the queue again on a new channel. A server-named queue keeps
+    /// its name while it still exists; if the broker deleted it, it is
+    /// declared anew and gets a new name.
+    async fn ensure_declared(&self, queue: RecordedQueue) -> Result<(Channel, String), Error> {
+        let mut channel = self.open_channel().await?;
+        if queue.requested_name.is_empty() {
+            let passive = QueueDeclareOpts {
+                passive: true,
+                ..Default::default()
+            };
+            match channel.queue_declare(&queue.name, passive).await {
+                Ok(_) => return Ok((channel, queue.name)),
+                // The failed passive declare closed the channel.
+                Err(Error::ChannelClosed { code: 404, .. }) => {
+                    channel = self.open_channel().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let ok = channel
+            .queue_declare(&queue.requested_name, queue.opts)
+            .await?;
+        self.topology
+            .lock()
+            .unwrap()
+            .rename_queue(self.id, &ok.queue);
+        Ok((channel, ok.queue))
+    }
+
+    async fn open_channel(&self) -> Result<Channel, Error> {
         let connection = self.connection.upgrade().ok_or(Error::ConnectionClosed {
             code: 0,
             reason: "client dropped".into(),
         })?;
-        let channel = connection.open_channel().await?;
+        connection.open_channel().await
+    }
+
+    async fn consume_on(
+        &self,
+        channel: &Channel,
+        name: &str,
+        opts: &SubscribeOpts,
+    ) -> Result<Consumer, Error> {
         channel.basic_qos(opts.prefetch, false).await?;
         let consume = ConsumeOpts {
             no_local: false,
             no_ack: opts.no_ack,
             exclusive: opts.exclusive,
-            arguments: opts.arguments,
+            arguments: opts.arguments.clone(),
         };
         let tag = opts.consumer_tag.as_deref().unwrap_or("");
-        let consumer = channel.basic_consume(&self.name(), tag, consume).await?;
-        Ok(TypedConsumer::new(consumer, channel, self.codec.clone()))
+        channel.basic_consume(name, tag, consume).await
+    }
+
+    /// Whether the queue is still recorded, i.e. not deleted via a handle.
+    pub(crate) fn is_recorded(&self) -> bool {
+        self.topology.lock().unwrap().queue(self.id).is_some()
+    }
+
+    pub(crate) fn recovery(&self) -> Option<&RecoveryConfig> {
+        self.recovery.as_ref()
+    }
+
+    pub(crate) fn codec(&self) -> &C {
+        &self.codec
     }
 
     /// Delete the queue and forget it and its bindings, so recovery does not

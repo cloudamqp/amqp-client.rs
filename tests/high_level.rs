@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use amqp_client_rs::{
     BasicProperties, Client, Codec, Connection, Error, ExchangeDeclareOpts, ExchangeKind,
-    QueueDeclareOpts, QueueDeleteOpts, SubscribeOpts, TypedConsumer, TypedDelivery,
+    QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -378,4 +378,63 @@ async fn queue_delete_ends_its_consumers() {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
     assert!(ch.queue_declare(&name, passive).await.is_err());
+}
+
+async fn recovering_json_client() -> Client<JsonCodec> {
+    Client::builder(AMQP_URI)
+        .unwrap()
+        .codec(JsonCodec)
+        .recovery(RecoveryConfig::default())
+        .build()
+        .await
+        .unwrap()
+}
+
+/// Acks the first delivery twice; the broker closes the consumer's channel
+/// with PRECONDITION_FAILED (unknown delivery tag).
+async fn close_consumer_channel(
+    client: &Client<JsonCodec>,
+    queue: &str,
+    consumer: &mut TypedConsumer<Greeting, JsonCodec>,
+) {
+    client.publish("", queue, &greeting(1)).await.unwrap();
+    let first = next_within(consumer, Duration::from_secs(5))
+        .await
+        .expect("no first message");
+    first.ack().unwrap();
+    first.ack().unwrap();
+}
+
+/// With recovery, a consumer whose channel the broker closed consumes again
+/// on a new channel.
+#[tokio::test]
+async fn consumer_recovers_after_channel_closed() {
+    let client = recovering_json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    close_consumer_channel(&client, &q.name(), &mut consumer).await;
+
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let delivery = next_within(&mut consumer, Duration::from_secs(5))
+        .await
+        .expect("consumer did not recover");
+    assert_eq!(delivery.body, greeting(2));
+}
+
+/// Without recovery, the consumer ends when its channel is closed.
+#[tokio::test]
+async fn consumer_ends_after_channel_closed_without_recovery() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    close_consumer_channel(&client, &q.name(), &mut consumer).await;
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
 }

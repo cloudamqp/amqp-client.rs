@@ -77,8 +77,11 @@ q.delete(QueueDeleteOpts::default()).await?;
 
 - **Order.** Exchanges, then exchange-to-exchange bindings, then queues, then
   queue bindings, then consumers. Within each step, first-declared first.
-- **Server-named queues** get a new name on every redeclare. `Queue::name()` and
-  every recorded binding of that queue follow the new name.
+- **Server-named queues** get a new name when declared again on a new session.
+  In consumer-level recovery the session is alive, so a server-named queue
+  keeps its name while it still exists (checked with a passive declare) and
+  is declared anew only if the broker deleted it. `Queue::name()` and every
+  recorded binding of that queue follow the new name.
 - **Consumer-level recovery** (`ChannelClosed`, `ServerCancel` while the session
   is alive) runs inside the consumer's `next()`: open a channel, declare the
   queue and its bindings, set prefetch, consume. On failure it waits

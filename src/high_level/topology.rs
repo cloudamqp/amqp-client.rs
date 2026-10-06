@@ -12,6 +12,7 @@ pub(crate) struct RecordedExchange {
     pub(crate) opts: ExchangeDeclareOpts,
 }
 
+#[derive(Clone)]
 pub(crate) struct RecordedQueue {
     pub(crate) id: QueueId,
     /// The name passed to `queue_declare`; empty for a server-named queue.
@@ -21,7 +22,7 @@ pub(crate) struct RecordedQueue {
     pub(crate) opts: QueueDeclareOpts,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct RecordedBinding {
     pub(crate) queue: QueueId,
     pub(crate) exchange: String,
@@ -85,11 +86,12 @@ impl Topology {
         }
     }
 
+    pub(crate) fn queue(&self, id: QueueId) -> Option<&RecordedQueue> {
+        self.queues.iter().find(|q| q.id == id)
+    }
+
     pub(crate) fn queue_name(&self, id: QueueId) -> Option<&str> {
-        self.queues
-            .iter()
-            .find(|q| q.id == id)
-            .map(|q| q.name.as_str())
+        self.queue(id).map(|q| q.name.as_str())
     }
 
     pub(crate) fn forget_queue(&mut self, id: QueueId) {
