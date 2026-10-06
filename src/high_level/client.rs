@@ -22,10 +22,11 @@ use crate::protocol::types::ShortStr;
 /// codec that handles your message types.
 ///
 /// The client connects once at [`ClientBuilder::build`] time and holds that
-/// connection for its lifetime. If the underlying connection drops,
-/// `publish` returns an error and consumers' `next()` returns `None`
-/// terminally — the client does not recover on its own. Recovery strategy is
-/// left to the caller (e.g. build a fresh `Client`).
+/// connection for its lifetime. With [`ClientBuilder::recovery`], a consumer
+/// whose channel closes or whose queue is cancelled declares its queue and
+/// bindings again and consumes again. Recovery from losing the connection
+/// itself is not built yet: `publish` then returns an error and consumers'
+/// `next()` returns `None`.
 ///
 /// Use [`Client::builder`] to create a new client.
 pub struct Client<C: Codec = ByteCodec> {

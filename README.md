@@ -105,8 +105,11 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
 }
 ```
 
-The client records the exchanges, queues and bindings declared through it;
-automatic recovery that declares them again is designed in
+The client records the exchanges, queues and bindings declared through it.
+With `.recovery(RecoveryConfig::default())` on the builder, a consumer whose
+channel is closed (e.g. consumer timeout) or whose queue is deleted declares
+the queue and its bindings again and consumes again. Recovery after losing the
+connection is designed in
 [ADR-0002](docs/adr/0002-recorded-topology-and-recovery.md) but not built yet.
 
 ## Requirements

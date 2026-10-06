@@ -52,8 +52,8 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
         .subscribe::<MyMessage>(SubscribeOpts::default())
         .await?;
 
-    // The Client does not recover from connection drops yet. When next()
-    // returns None, the consumer is done.
+    // Without `.recovery(RecoveryConfig::default())` on the builder, the
+    // consumer ends (next() returns None) when its channel or connection does.
     while let Some(delivery) = consumer.next().await {
         println!("Received: {:?}", delivery.body);
         delivery.ack()?;

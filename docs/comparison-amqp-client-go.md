@@ -31,11 +31,11 @@ amqp-client.rs uses config-wide `connect_timeout` / `rpc_timeout` (callers can w
 
 | Feature | amqp-client.rs | amqp-client.go |
 |---|---|---|
-| Automatic recovery | Not implemented (ADR-0002 accepted) | Yes, always on |
+| Automatic recovery | Opt-in via `RecoveryConfig`; consumer-level done, connection-level not yet (ADR-0002) | Yes, always on |
 | Recovery trigger | Operation-driven (ADR-0002) | Background supervisor reconnects as soon as `conn.Done()` fires |
 | Retry wait | Fixed `RecoveryConfig::timeout` (250ms), no backoff | Exponential: 1s doubling to 30s; first retry immediate |
 | Give up | Never | `MaxRetries` (0 = never), then `OnFailed` |
-| Topology restore | Recorded topology, as in Go (ADR-0002); recorded today, redeclared once recovery lands | Declarative: records queues/exchanges/bindings declared via `Client` and redeclares them; server-named queues get a new name, `Queue.Name()` updates |
+| Topology restore | Recorded topology, as in Go (ADR-0002); a consumer's queue and bindings are redeclared on consumer-level recovery | Declarative: records queues/exchanges/bindings declared via `Client` and redeclares them; server-named queues get a new name, `Queue.Name()` updates |
 | Channel-close recovery | Consumers recover after `ChannelClosed` and `ServerCancel` (ADR-0002) | Subscriptions re-consume after channel close too (e.g. consumer timeout) |
 | Waits during recovery | Bounded by `RecoveryConfig::timeout`, then `ConnectionClosed` | Bounded by caller's `ctx` |
 | Lifecycle hooks | None | `OnConnect`, `OnDisconnect`, `OnFailed`, `OnReturn` |
