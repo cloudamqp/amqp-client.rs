@@ -510,9 +510,17 @@ impl Connection {
     /// Open a new AMQP channel on this connection.
     pub async fn open_channel(&self) -> Result<Channel, Error> {
         let channel_id = self.allocate_channel_id()?;
+        // Undoes the open on every early return, and if this future is
+        // dropped while waiting for OpenOk.
+        let mut pending = PendingOpen {
+            connection: self,
+            channel_id,
+            sent: false,
+            done: false,
+        };
 
         // Create unbounded channel for incoming frames to this AMQP channel
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
 
         // Register in the channel registry
         self.channel_senders
@@ -523,9 +531,9 @@ impl Connection {
         // Send Channel.Open
         let frame = Frame::Method(channel_id, MethodFrame::ChannelOpen);
         self.shared.send(OutgoingFrame::Frame(frame))?;
+        pending.sent = true;
 
         // Wait for Channel.OpenOk
-        let mut incoming_rx = incoming_rx;
         let response = match tokio::time::timeout(self.rpc_timeout, incoming_rx.recv()).await {
             Ok(Some(frame)) => frame,
             Ok(None) => {
@@ -534,17 +542,17 @@ impl Connection {
                     reason: "connection closed while opening channel".into(),
                 });
             }
-            Err(_) => {
-                self.channel_senders.lock().unwrap().remove(&channel_id);
-                // The broker may still open it; close it before reusing the id.
-                self.shared.close_without_waiting(channel_id);
-                return Err(Error::Timeout);
-            }
+            Err(_) => return Err(Error::Timeout),
         };
 
         match response {
             Frame::Method(_, MethodFrame::ChannelOpenOk) => {}
             Frame::Method(_, MethodFrame::ChannelClose(close)) => {
+                // The broker refused the open: confirm the close; the id is
+                // then free.
+                let close_ok = Frame::Method(channel_id, MethodFrame::ChannelCloseOk);
+                let _ = self.shared.send(OutgoingFrame::Frame(close_ok));
+                pending.sent = false;
                 return Err(Error::ChannelClosed {
                     channel_id,
                     code: close.reply_code,
@@ -560,6 +568,7 @@ impl Connection {
                 ));
             }
         }
+        pending.done = true;
 
         debug!(channel_id, "channel opened");
 
@@ -621,6 +630,35 @@ impl Connection {
             .unwrap()
             .allocate()
             .ok_or(Error::ChannelLimitReached)
+    }
+}
+
+/// An `open_channel` in progress. Dropped before `done`, it unregisters the
+/// channel and frees its id; if `Channel.Open` was sent, it closes the channel
+/// on the broker first, and the id is freed on `CloseOk`.
+struct PendingOpen<'a> {
+    connection: &'a Connection,
+    channel_id: u16,
+    sent: bool,
+    done: bool,
+}
+
+impl Drop for PendingOpen<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let shared = &self.connection.shared;
+        self.connection
+            .channel_senders
+            .lock()
+            .unwrap()
+            .remove(&self.channel_id);
+        if self.sent {
+            shared.close_without_waiting(self.channel_id);
+        } else {
+            shared.id_alloc.lock().unwrap().release(self.channel_id);
+        }
     }
 }
 

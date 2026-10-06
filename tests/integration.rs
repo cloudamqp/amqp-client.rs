@@ -700,3 +700,19 @@ async fn ack_after_the_channel_is_dropped_fails() {
     };
     ch2.queue_declare(&queue, passive).await.unwrap();
 }
+
+/// An `open_channel` cancelled while waiting for OpenOk closes the channel on
+/// the broker and frees its id, instead of leaking it.
+#[tokio::test]
+async fn cancelled_open_channel_frees_its_id() {
+    let proxy = support::proxy::Proxy::start().await;
+    let conn = Connection::connect(&proxy.uri()).await.unwrap();
+    proxy.freeze();
+    let cancelled = tokio::time::timeout(Duration::from_millis(200), conn.open_channel()).await;
+    assert!(cancelled.is_err(), "open should still be waiting");
+    proxy.unfreeze();
+    tokio::time::sleep(Duration::from_millis(300)).await; // OpenOk, then CloseOk
+
+    let ch = conn.open_channel().await.unwrap();
+    assert_eq!(ch.id(), 1, "the cancelled open's id was not freed");
+}
