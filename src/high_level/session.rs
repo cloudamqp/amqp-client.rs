@@ -128,7 +128,7 @@ impl ClientInner {
     /// Runs `op` on a usable session. With recovery on, it first waits for
     /// recovery in progress, and if `op` finds the session lost, triggers
     /// recovery, waits for it and runs `op` once more. All waiting together
-    /// takes at most the recovery timeout.
+    /// takes at most the recovery timeout (time spent in `op` not counted).
     pub(crate) async fn with_session<R, F, Fut>(self: &Arc<Self>, op: F) -> Result<R, Error>
     where
         F: Fn(Arc<Session>) -> Fut,
@@ -137,8 +137,8 @@ impl ClientInner {
         let Some(timeout) = self.recovery.as_ref().map(|r| r.timeout) else {
             return run_on(self.current(), &op).await;
         };
-        let deadline = Instant::now() + timeout;
-        let remaining = || Some(deadline.saturating_duration_since(Instant::now()));
+        // The budget covers waiting only, not the time `op` itself takes.
+        let mut budget = timeout;
         let session = {
             let slot = self.slot.lock().unwrap();
             (!slot.recovering).then(|| slot.session.clone())
@@ -147,13 +147,16 @@ impl ClientInner {
             Some(session) => session,
             None => {
                 let generation = self.current().generation;
-                session_after(Arc::downgrade(self), generation, remaining()).await?
+                let started = Instant::now();
+                let session = session_after(Arc::downgrade(self), generation, Some(budget)).await?;
+                budget = budget.saturating_sub(started.elapsed());
+                session
             }
         };
         match run_on(session.clone(), &op).await {
             Err(Error::ConnectionClosed { .. }) => {
                 let next =
-                    session_after(Arc::downgrade(self), session.generation, remaining()).await?;
+                    session_after(Arc::downgrade(self), session.generation, Some(budget)).await?;
                 run_on(next, &op).await
             }
             result => result,

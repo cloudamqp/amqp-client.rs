@@ -241,7 +241,12 @@ enum RpcOutcome {
     Method(MethodFrame),
     Get(GetMessage),
     GetEmpty,
-    ChannelClosed { code: u16, reason: String },
+    ChannelClosed {
+        code: u16,
+        reason: String,
+    },
+    /// The connection was lost before the reply arrived.
+    ConnectionClosed,
 }
 
 /// In-flight RPC slot: a typed kind, a oneshot back to the awaiter, and a
@@ -748,6 +753,7 @@ impl Channel {
                 code,
                 reason,
             }),
+            RpcOutcome::ConnectionClosed => Err(connection_closed()),
             RpcOutcome::Method(other) => Err(unexpected("Basic.GetOk or Basic.GetEmpty", &other)),
         }
     }
@@ -1162,6 +1168,7 @@ impl Channel {
     ) -> Result<MethodFrame, Error> {
         match self.rpc_call(request, RpcKind::PlainMethod).await? {
             RpcOutcome::Method(m) => Ok(m),
+            RpcOutcome::ConnectionClosed => Err(connection_closed()),
             RpcOutcome::ChannelClosed { code, reason } => Err(Error::ChannelClosed {
                 channel_id: self.id,
                 code,
@@ -1194,6 +1201,13 @@ impl Drop for Channel {
             // Still open on the broker: close it there before reusing the ID.
             self.shared.close_without_waiting(self.id);
         }
+    }
+}
+
+fn connection_closed() -> Error {
+    Error::ConnectionClosed {
+        code: 0,
+        reason: "connection closed".into(),
     }
 }
 
@@ -1248,13 +1262,7 @@ async fn dispatch_loop(
                     },
                 );
                 drop_all_pending_confirms(&confirms_state);
-                resolve_inflight(
-                    &inflight_rpc,
-                    RpcOutcome::ChannelClosed {
-                        code: 0,
-                        reason: "connection closed".into(),
-                    },
-                );
+                resolve_inflight(&inflight_rpc, RpcOutcome::ConnectionClosed);
                 return;
             }
         };

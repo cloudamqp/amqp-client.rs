@@ -342,3 +342,26 @@ async fn publish_confirmed_is_retried_when_it_was_never_sent() {
     assert_eq!(depth(&queue).await, 1);
     delete_queue(&queue).await;
 }
+
+/// A declare in flight when the connection is lost waits for recovery and
+/// succeeds on the new session.
+#[tokio::test]
+async fn an_operation_in_flight_at_connection_loss_is_retried() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    proxy.freeze();
+    let exclusive = QueueDeclareOpts {
+        exclusive: true,
+        ..Default::default()
+    };
+    let declare = tokio::spawn(async move { client.queue("", exclusive).await.map(|_| ()) });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    proxy.cut();
+    proxy.unfreeze();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), declare)
+        .await
+        .expect("declare hung")
+        .unwrap();
+    assert!(result.is_ok(), "{result:?}");
+}
