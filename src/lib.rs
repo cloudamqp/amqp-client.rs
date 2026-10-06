@@ -42,11 +42,15 @@ pub use client::channel::{
 pub use client::config::Config;
 pub use client::connection::Connection;
 pub use client::consumer::{CancellationReason, Consumer};
-pub use client::exchange::Exchange;
 pub use client::message::{DeliverMessage, GetMessage};
-pub use client::queue::Queue;
 pub use error::{Error, ProtocolError};
 pub use high_level::{ByteCodec, Client, ClientBuilder, Codec, TypedConsumer, TypedDelivery};
 pub use protocol::properties::BasicProperties;
 pub use protocol::table::{FieldValue, Table};
 pub use protocol::types::{LongStr, ShortStr};
+
+/// Fluent wrappers that borrow a low-level [`Channel`].
+pub mod low_level {
+    pub use crate::client::exchange::Exchange;
+    pub use crate::client::queue::Queue;
+}
