@@ -118,6 +118,9 @@ With `.recovery(RecoveryConfig::default())` on the builder
 - Unacked messages are redelivered, so make handlers idempotent. Publishes are
   not confirmed: one sent just as the connection drops can be lost.
 
+`cargo run --example recovery` publishes and consumes a tick every second;
+restart the broker while it runs to watch it recover.
+
 ## Requirements
 
 - Rust 2024 edition
