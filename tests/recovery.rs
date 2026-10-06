@@ -365,3 +365,33 @@ async fn an_operation_in_flight_at_connection_loss_is_retried() {
         .unwrap();
     assert!(result.is_ok(), "{result:?}");
 }
+
+/// Many operations hitting one connection loss at once cause exactly one
+/// reconnect.
+#[tokio::test]
+async fn concurrent_operations_share_one_recovery() {
+    let proxy = Proxy::start().await;
+    let client = std::sync::Arc::new(recovering_client(&proxy).await);
+    let queue = name("concurrent");
+    client
+        .queue(&queue, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+
+    proxy.cut();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let publishes: Vec<_> = (0..20)
+        .map(|_| {
+            let client = client.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move { client.publish_confirmed("", &queue, &vec![1u8]).await })
+        })
+        .collect();
+    for publish in publishes {
+        publish.await.unwrap().unwrap();
+    }
+
+    assert_eq!(proxy.accepted(), 2, "expected exactly one reconnect");
+    assert_eq!(depth(&queue).await, 20);
+    delete_queue(&queue).await;
+}

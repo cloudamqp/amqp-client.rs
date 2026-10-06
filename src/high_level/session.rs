@@ -139,14 +139,20 @@ impl ClientInner {
         };
         // The budget covers waiting only, not the time `op` itself takes.
         let mut budget = timeout;
-        let session = {
+        // Read both under one lock: if recovery finished in between, waiting
+        // for a session after the new generation would start a needless
+        // second recovery and tear down the session just installed.
+        let current = {
             let slot = self.slot.lock().unwrap();
-            (!slot.recovering).then(|| slot.session.clone())
+            if slot.recovering {
+                Err(slot.session.generation)
+            } else {
+                Ok(slot.session.clone())
+            }
         };
-        let session = match session {
-            Some(session) => session,
-            None => {
-                let generation = self.current().generation;
+        let session = match current {
+            Ok(session) => session,
+            Err(generation) => {
                 let started = Instant::now();
                 let session = session_after(Arc::downgrade(self), generation, Some(budget)).await?;
                 budget = budget.saturating_sub(started.elapsed());
