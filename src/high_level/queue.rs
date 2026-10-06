@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::codec::{ByteCodec, Codec};
 use super::consumer::{SubscribeOpts, TypedConsumer};
+use super::recovery::RecoveryConfig;
 use super::topology::{QueueId, Topology};
 use crate::client::channel::{Channel, ConsumeOpts, QueueDeleteOpts};
 use crate::client::connection::Connection;
@@ -18,6 +19,7 @@ pub struct Queue<C: Codec = ByteCodec> {
     /// after the `Client` is dropped.
     connection: Weak<Connection>,
     codec: Arc<C>,
+    recovery: Option<RecoveryConfig>,
 }
 
 impl<C: Codec> Clone for Queue<C> {
@@ -28,6 +30,7 @@ impl<C: Codec> Clone for Queue<C> {
             channel: self.channel.clone(),
             connection: self.connection.clone(),
             codec: self.codec.clone(),
+            recovery: self.recovery.clone(),
         }
     }
 }
@@ -39,6 +42,7 @@ impl<C: Codec> Queue<C> {
         channel: Arc<Channel>,
         connection: Weak<Connection>,
         codec: Arc<C>,
+        recovery: Option<RecoveryConfig>,
     ) -> Self {
         Self {
             id,
@@ -46,6 +50,7 @@ impl<C: Codec> Queue<C> {
             channel,
             connection,
             codec,
+            recovery,
         }
     }
 

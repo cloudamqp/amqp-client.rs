@@ -5,6 +5,7 @@ use tracing::{debug, info};
 use super::codec::{ByteCodec, Codec};
 use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
+use super::recovery::RecoveryConfig;
 use super::topology::Topology;
 use crate::client::channel::{Channel, ExchangeDeclareOpts, QueueDeclareOpts};
 use crate::client::config::Config;
@@ -34,6 +35,7 @@ pub struct Client<C: Codec = ByteCodec> {
     connection: Arc<Connection>,
     channel: Arc<Channel>,
     topology: Arc<Mutex<Topology>>,
+    recovery: Option<RecoveryConfig>,
 }
 
 impl Client<ByteCodec> {
@@ -47,6 +49,7 @@ impl Client<ByteCodec> {
         Ok(ClientBuilder {
             config,
             codec: Arc::new(ByteCodec),
+            recovery: None,
         })
     }
 }
@@ -113,6 +116,7 @@ impl<C: Codec> Client<C> {
             self.channel.clone(),
             Arc::downgrade(&self.connection),
             self.codec.clone(),
+            self.recovery.clone(),
         ))
     }
 
@@ -171,6 +175,7 @@ impl<C: Codec> Client<C> {
 pub struct ClientBuilder<C: Codec = ByteCodec> {
     config: Config,
     codec: Arc<C>,
+    recovery: Option<RecoveryConfig>,
 }
 
 impl<C: Codec> ClientBuilder<C> {
@@ -180,7 +185,15 @@ impl<C: Codec> ClientBuilder<C> {
         ClientBuilder {
             config: self.config,
             codec: Arc::new(codec),
+            recovery: self.recovery,
         }
+    }
+
+    /// Turn on automatic recovery (ADR-0002). Without it, losing a channel or
+    /// the connection ends consumers.
+    pub fn recovery(mut self, config: RecoveryConfig) -> Self {
+        self.recovery = Some(config);
+        self
     }
 
     /// Build and connect the client.
@@ -199,6 +212,7 @@ impl<C: Codec> ClientBuilder<C> {
             connection: Arc::new(connection),
             channel,
             topology: Arc::default(),
+            recovery: self.recovery,
         })
     }
 }
