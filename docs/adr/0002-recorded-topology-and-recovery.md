@@ -87,7 +87,8 @@ q.delete(QueueDeleteOpts::default()).await?;
   recorded binding of that queue follow the new name.
 - **Consumer-level recovery** (`ChannelClosed`, `ServerCancel` while the session
   is alive) runs inside the consumer's `next()`: open a channel, declare the
-  queue and its bindings, set prefetch, consume. On failure it waits
+  queue, the recorded exchanges its bindings use (one may be gone too, e.g.
+  auto-deleted), and its bindings, set prefetch, consume. On failure it waits
   `RecoveryConfig::timeout` and retries. If it observes session loss, it becomes
   a recovery waiter on the session recovery above.
 - **Declaration failures during recovery** (e.g. `PRECONDITION_FAILED`) fail

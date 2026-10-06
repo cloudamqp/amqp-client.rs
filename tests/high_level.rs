@@ -571,3 +571,48 @@ async fn client_reopens_its_channel_after_the_broker_closes_it() {
     client.publish("", &q.name(), &vec![1u8]).await.unwrap();
     assert!(has_message(&client, &q.name()).await);
 }
+
+/// If the queue's exchange is gone too, consumer recovery declares the
+/// recorded exchange again before binding.
+#[tokio::test]
+async fn consumer_recovery_declares_a_deleted_exchange_again() {
+    let client = recovering_json_client().await;
+    let ex = client
+        .topic(&queue_name("gone-ex"), ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let name = queue_name("gone-ex-q");
+    let q = client
+        .queue(&name, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    q.bind(&ex, "k").await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    ch.exchange_delete(ex.name(), false).await.unwrap();
+    ch.queue_delete(&name, QueueDeleteOpts::default())
+        .await
+        .unwrap();
+
+    let mut received = false;
+    for _ in 0..50 {
+        let _ = client.publish(ex.name(), "k", &greeting(7)).await;
+        if let Some(d) = next_within(&mut consumer, Duration::from_millis(100)).await {
+            d.ack().unwrap();
+            received = true;
+            break;
+        }
+    }
+    assert!(received, "consumer did not recover");
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+    client
+        .channel()
+        .exchange_delete(ex.name(), false)
+        .await
+        .unwrap();
+}

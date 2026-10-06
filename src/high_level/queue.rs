@@ -114,13 +114,14 @@ impl<C: Codec> Queue<C> {
     }
 
     /// Consumer-level recovery: on a new channel of `session`, declare the
-    /// queue and its bindings again, then consume.
+    /// queue, the recorded exchanges its bindings use, and its bindings
+    /// again, then consume.
     pub(crate) async fn redeclare_and_consume(
         &self,
         session: &Session,
         opts: &SubscribeOpts,
     ) -> Result<(Channel, Consumer), Error> {
-        let (queue, bindings) = {
+        let (queue, bindings, exchanges) = {
             let topology = self.topology.lock().unwrap();
             let Some(queue) = topology.queue(self.id).cloned() else {
                 return Err(Error::ConnectionClosed {
@@ -129,9 +130,20 @@ impl<C: Codec> Queue<C> {
                 });
             };
             let bindings: Vec<_> = topology.bindings_for(self.id).cloned().collect();
-            (queue, bindings)
+            // The recorded exchanges these bindings use; one may be gone too
+            // (e.g. auto-deleted along with the queue's binding).
+            let exchanges: Vec<_> = topology
+                .exchanges()
+                .iter()
+                .filter(|e| bindings.iter().any(|b| b.exchange == e.name))
+                .cloned()
+                .collect();
+            (queue, bindings, exchanges)
         };
         let (channel, name) = self.ensure_declared(session, queue).await?;
+        for e in exchanges {
+            channel.exchange_declare(&e.name, &e.kind, e.opts).await?;
+        }
         for b in bindings {
             channel
                 .queue_bind(&name, &b.exchange, &b.routing_key, b.arguments)
