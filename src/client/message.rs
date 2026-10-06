@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use super::channel::{ClosedState, check_open};
 use super::connection::{ConnectionShared, OutgoingFrame};
 use crate::error::Error;
 use crate::protocol::frame::Frame;
@@ -14,11 +15,16 @@ use crate::protocol::types::ShortStr;
 pub(crate) struct MessageHandle {
     channel_id: u16,
     shared: Arc<ConnectionShared>,
+    closed: ClosedState,
 }
 
 impl MessageHandle {
-    pub(crate) fn new(channel_id: u16, shared: Arc<ConnectionShared>) -> Self {
-        Self { channel_id, shared }
+    pub(crate) fn new(channel_id: u16, shared: Arc<ConnectionShared>, closed: ClosedState) -> Self {
+        Self {
+            channel_id,
+            shared,
+            closed,
+        }
     }
 
     fn ack(&self, delivery_tag: u64) -> Result<(), Error> {
@@ -44,6 +50,8 @@ impl MessageHandle {
     }
 
     fn send_method(&self, method: MethodFrame) -> Result<(), Error> {
+        // Acking on a channel the broker closed is a connection error.
+        check_open(self.channel_id, &self.closed)?;
         self.shared
             .frame_tx
             .send(OutgoingFrame::Frame(Frame::Method(self.channel_id, method)))
@@ -154,7 +162,7 @@ mod tests {
             id_alloc: Mutex::new(ChannelIdAllocator::new(1)),
             dead: tokio::sync::Notify::new(),
         });
-        (MessageHandle::new(7, shared), rx)
+        (MessageHandle::new(7, shared, ClosedState::default()), rx)
     }
 
     #[test]
@@ -204,6 +212,17 @@ mod tests {
                 })
             ))
         ));
+    }
+
+    #[test]
+    fn ack_on_a_closed_channel_errors() {
+        let (h, mut rx) = handle();
+        let _ = h.closed.set((406, "PRECONDITION_FAILED".into()));
+        assert!(matches!(
+            h.ack(1),
+            Err(Error::ChannelClosed { code: 406, .. })
+        ));
+        assert!(rx.try_recv().is_err(), "ack was sent on a closed channel");
     }
 
     #[test]

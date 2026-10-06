@@ -568,3 +568,47 @@ async fn heartbeat_timeout_ends_the_connection() {
         Err(amqp_client_rs::Error::ConnectionClosed { .. })
     ));
 }
+
+/// After the broker closes a channel, publishing and RPCs on it fail at once
+/// with `ChannelClosed` instead of being dropped or waiting for rpc_timeout.
+#[tokio::test]
+async fn operations_on_a_broker_closed_channel_fail_fast() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let name = format!("amqp-client-rs-test-closed-{}", std::process::id());
+    let ch = conn.open_channel().await.unwrap();
+    ch.exchange_declare(&name, "direct", ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let refused = ch
+        .exchange_declare(&name, "fanout", ExchangeDeclareOpts::default())
+        .await;
+    assert!(matches!(
+        refused,
+        Err(amqp_client_rs::Error::ChannelClosed { code: 406, .. })
+    ));
+
+    let published = ch
+        .basic_publish("", "nowhere", b"x".to_vec(), BasicProperties::default())
+        .await;
+    assert!(matches!(
+        published,
+        Err(amqp_client_rs::Error::ChannelClosed { .. })
+    ));
+    let declared = tokio::time::timeout(
+        Duration::from_secs(1),
+        ch.queue_declare("", QueueDeclareOpts::default()),
+    )
+    .await
+    .expect("RPC on a closed channel waited");
+    assert!(matches!(
+        declared,
+        Err(amqp_client_rs::Error::ChannelClosed { code: 406, .. })
+    ));
+
+    conn.open_channel()
+        .await
+        .unwrap()
+        .exchange_delete(&name, false)
+        .await
+        .unwrap();
+}

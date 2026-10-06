@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::{Bytes, BytesMut};
@@ -269,8 +268,9 @@ pub struct Channel {
     /// Channel registry (shared with connection) for cleanup on close.
     channel_senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Frame>>>>,
     /// Set once the channel is closed on the broker (by `close()` or by the
-    /// broker), so drop need not send `Channel.Close`.
-    closed: Arc<AtomicBool>,
+    /// broker): later operations fail with it, and drop need not send
+    /// `Channel.Close`.
+    closed: ClosedState,
     /// Per-channel RPC serialization lock. Each public RPC method takes
     /// this as an `OwnedMutexGuard` and hands ownership to the dispatch
     /// task via the `inflight_rpc` slot, so the next caller can't proceed
@@ -314,7 +314,7 @@ impl Channel {
         let confirms_state = Arc::new(Mutex::new(ConfirmsState::default()));
         let rpc_lock = Arc::new(tokio::sync::Mutex::new(()));
         let inflight_rpc: Arc<Mutex<Option<RpcExpectation>>> = Arc::new(Mutex::new(None));
-        let closed = Arc::new(AtomicBool::new(false));
+        let closed = ClosedState::default();
 
         // Spawn the dispatch task
         let dispatch_shared = shared.clone();
@@ -947,7 +947,7 @@ impl Channel {
         match response {
             MethodFrame::ChannelCloseOk => {
                 // Drop releases the registry entry and the ID.
-                self.closed.store(true, Ordering::Release);
+                let _ = self.closed.set((200, "closed by client".into()));
                 debug!(channel_id = self.id, "channel closed");
                 Ok(())
             }
@@ -960,6 +960,7 @@ impl Channel {
     // -----------------------------------------------------------------------
 
     fn send_frame(&self, frame: Frame) -> Result<(), Error> {
+        self.check_open()?;
         self.shared
             .frame_tx
             .send(OutgoingFrame::Frame(frame))
@@ -971,6 +972,10 @@ impl Channel {
 
     fn send_method(&self, method: MethodFrame) -> Result<(), Error> {
         self.send_frame(Frame::Method(self.id, method))
+    }
+
+    fn check_open(&self) -> Result<(), Error> {
+        check_open(self.id, &self.closed)
     }
 
     /// Acquire publish-admission permits proportional to `body_len` (capped
@@ -1060,6 +1065,7 @@ impl Channel {
         frame: Frame,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), Error> {
+        self.check_open()?;
         let item = match permit {
             Some(p) => OutgoingFrame::FrameWithPermit(frame, p),
             None => OutgoingFrame::Frame(frame),
@@ -1111,6 +1117,12 @@ impl Channel {
                 tx,
                 _guard: guard,
             });
+        }
+        // The broker may have closed the channel after the send but before
+        // the expectation was registered; dispatch then never resolves it.
+        if let Err(e) = self.check_open() {
+            self.inflight_rpc.lock().unwrap().take();
+            return Err(e);
         }
 
         // Await the typed outcome with the configured timeout. On timeout we
@@ -1164,12 +1176,27 @@ impl Drop for Channel {
         // free-list so it can be reused.
         self.channel_senders.lock().unwrap().remove(&self.id);
         self._dispatch_task.abort();
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.get().is_some() {
             self.shared.id_alloc.lock().unwrap().release(self.id);
         } else {
             // Still open on the broker: close it there before reusing the ID.
             self.shared.close_without_waiting(self.id);
         }
+    }
+}
+
+/// The broker's reply code and text once a channel is closed.
+pub(crate) type ClosedState = Arc<OnceLock<(u16, String)>>;
+
+/// `Err(ChannelClosed)` once `closed` is set.
+pub(crate) fn check_open(channel_id: u16, closed: &ClosedState) -> Result<(), Error> {
+    match closed.get() {
+        Some((code, reason)) => Err(Error::ChannelClosed {
+            channel_id,
+            code: *code,
+            reason: reason.clone(),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1186,7 +1213,7 @@ async fn dispatch_loop(
     flow_tx: tokio::sync::watch::Sender<bool>,
     returns_state: Arc<Mutex<ReturnsState>>,
     confirms_state: Arc<Mutex<ConfirmsState>>,
-    closed: Arc<AtomicBool>,
+    closed: ClosedState,
     mut rx: mpsc::UnboundedReceiver<Frame>,
 ) {
     let mut cached_consumers: HashMap<ShortStr, ConsumerEntry> = HashMap::new();
@@ -1228,6 +1255,7 @@ async fn dispatch_loop(
                     &consumer_senders,
                     &mut cached_consumers,
                     deliver,
+                    &closed,
                     &mut rx,
                 )
                 .await;
@@ -1262,7 +1290,7 @@ async fn dispatch_loop(
                             message_count: get_ok.message_count,
                             properties: header.properties,
                             body,
-                            handle: MessageHandle::new(channel_id, shared.clone()),
+                            handle: MessageHandle::new(channel_id, shared.clone(), closed.clone()),
                         };
                         if !resolve_inflight_get(&inflight_rpc, RpcOutcome::Get(msg)) {
                             warn!(
@@ -1295,7 +1323,7 @@ async fn dispatch_loop(
                     reason = %close.reply_text,
                     "server closing channel"
                 );
-                closed.store(true, Ordering::Release);
+                let _ = closed.set((close.reply_code, close.reply_text.to_string()));
                 let close_ok = Frame::Method(channel_id, MethodFrame::ChannelCloseOk);
                 let _ = shared.frame_tx.send(OutgoingFrame::Frame(close_ok));
                 set_cancellation_for_all(
@@ -1415,6 +1443,7 @@ async fn handle_deliver(
     consumer_senders: &Arc<Mutex<HashMap<ShortStr, ConsumerEntry>>>,
     cached_consumers: &mut HashMap<ShortStr, ConsumerEntry>,
     deliver: basic_method::Deliver,
+    closed: &ClosedState,
     rx: &mut mpsc::UnboundedReceiver<Frame>,
 ) {
     // Receive Header + Body
@@ -1437,7 +1466,7 @@ async fn handle_deliver(
         routing_key: deliver.routing_key,
         properties: header.properties,
         body,
-        handle: MessageHandle::new(channel_id, shared.clone()),
+        handle: MessageHandle::new(channel_id, shared.clone(), closed.clone()),
     };
 
     // Look up entry in local cache first, falling back to the shared map.
