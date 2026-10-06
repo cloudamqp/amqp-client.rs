@@ -191,23 +191,35 @@ pub(crate) async fn session_after(
 /// demand reaches zero or the client is dropped.
 async fn recover(client: Weak<ClientInner>) {
     loop {
-        let Some(inner) = client.upgrade() else {
-            return;
-        };
-        let generation = {
+        // Hold the client only to read what an attempt needs: a stalled
+        // connect must not keep a dropped client (and its consumers) alive.
+        let (config, topology, timeout, generation) = {
+            let Some(inner) = client.upgrade() else {
+                return;
+            };
             let mut slot = inner.slot.lock().unwrap();
             if slot.waiters == 0 && slot.consumers == 0 {
                 slot.recovering = false;
                 return;
             }
-            slot.session.generation + 1
+            let timeout = inner
+                .recovery
+                .as_ref()
+                .map_or(Duration::ZERO, |r| r.timeout);
+            (
+                inner.config.clone(),
+                inner.topology.clone(),
+                timeout,
+                slot.session.generation + 1,
+            )
         };
-        let timeout = inner
-            .recovery
-            .as_ref()
-            .map_or(Duration::ZERO, |r| r.timeout);
-        match open_session(&inner.config, &inner.topology, generation).await {
+        match open_session(&config, &topology, generation).await {
             Ok(session) => {
+                // If the client was dropped meanwhile, the session is dropped
+                // (and closed) here.
+                let Some(inner) = client.upgrade() else {
+                    return;
+                };
                 {
                     let mut slot = inner.slot.lock().unwrap();
                     slot.session = Arc::new(session);
@@ -219,7 +231,6 @@ async fn recover(client: Weak<ClientInner>) {
             }
             Err(e) => warn!(error = %e, "session recovery failed, retrying"),
         }
-        drop(inner);
         tokio::time::sleep(timeout).await;
     }
 }

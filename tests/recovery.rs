@@ -261,3 +261,30 @@ async fn dropping_the_client_ends_an_idle_consumer() {
         );
     }
 }
+
+/// Dropping the client ends a waiting consumer promptly even while a
+/// reconnect attempt is stalled (broker accepts TCP but never answers).
+#[tokio::test]
+async fn dropping_the_client_during_a_stalled_reconnect_ends_consumers() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    let queue = name("stalled");
+    let q = client
+        .queue(&queue, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    proxy.freeze();
+    proxy.cut();
+
+    let next = tokio::spawn(async move { consumer.next().await.is_none() });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(client);
+
+    let ended = tokio::time::timeout(Duration::from_secs(2), next).await;
+    assert!(matches!(ended, Ok(Ok(true))), "consumer did not end");
+    delete_queue(&queue).await;
+}
