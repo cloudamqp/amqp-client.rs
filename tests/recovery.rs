@@ -395,3 +395,31 @@ async fn concurrent_operations_share_one_recovery() {
     assert_eq!(depth(&queue).await, 20);
     delete_queue(&queue).await;
 }
+
+/// A consumer that has ended (its queue deleted through the handle) but is
+/// not dropped yet no longer keeps recovery reconnecting.
+#[tokio::test]
+async fn an_ended_consumer_is_not_recovery_demand() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    let q = client
+        .queue(&name("ended"), QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+
+    proxy.set_down(true);
+    proxy.cut();
+    time_failing_publish(&client, "amq.unrouted").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let attempts = proxy.accepted();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(proxy.accepted(), attempts, "recovery kept reconnecting");
+    drop(consumer);
+}

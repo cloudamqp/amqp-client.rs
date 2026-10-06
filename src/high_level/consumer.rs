@@ -92,6 +92,9 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
                 if self.recover().await {
                     continue;
                 }
+                // Ended for good: no longer recovery demand, even if the
+                // caller keeps the consumer around.
+                self._registration = None;
                 return None;
             };
             match self.queue.codec().decode::<T>(&msg.body) {
