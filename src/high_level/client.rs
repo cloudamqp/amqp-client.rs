@@ -1,26 +1,17 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use tracing::{debug, info};
 
 use super::codec::{ByteCodec, Codec};
-use super::consumer::TypedConsumer;
 use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
 use super::topology::Topology;
-use crate::client::channel::{Channel, ConsumeOpts, ExchangeDeclareOpts, QueueDeclareOpts};
+use crate::client::channel::{Channel, ExchangeDeclareOpts, QueueDeclareOpts};
 use crate::client::config::Config;
 use crate::client::connection::Connection;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
 use crate::protocol::types::ShortStr;
-
-/// A closure that runs after connection to declare queues, exchanges,
-/// bindings, and other topology.
-type SetupFn = Box<
-    dyn Fn(&Channel) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> + Send + Sync,
->;
 
 /// A high-level AMQP client with typed publish/consume and codec-based
 /// serialization.
@@ -38,9 +29,9 @@ type SetupFn = Box<
 /// Use [`Client::builder`] to create a new client.
 pub struct Client<C: Codec = ByteCodec> {
     codec: Arc<C>,
-    /// Owned to keep the connection alive — dropping it tears the channel down.
-    /// Only used via `Drop`, no methods called.
-    _connection: Connection,
+    /// The only strong reference: dropping the `Client` closes the connection,
+    /// ending every consumer.
+    connection: Arc<Connection>,
     channel: Arc<Channel>,
     topology: Arc<Mutex<Topology>>,
 }
@@ -56,7 +47,6 @@ impl Client<ByteCodec> {
         Ok(ClientBuilder {
             config,
             codec: Arc::new(ByteCodec),
-            setup: None,
         })
     }
 }
@@ -110,14 +100,20 @@ impl<C: Codec> Client<C> {
 
     /// Declare a queue and record it, so it is declared again after recovery.
     /// An empty `name` lets the broker name the queue.
-    pub async fn queue(&self, name: &str, opts: QueueDeclareOpts) -> Result<Queue, Error> {
+    pub async fn queue(&self, name: &str, opts: QueueDeclareOpts) -> Result<Queue<C>, Error> {
         let ok = self.channel.queue_declare(name, opts.clone()).await?;
         let id = self
             .topology
             .lock()
             .unwrap()
             .record_queue(name, &ok.queue, opts);
-        Ok(Queue::new(id, self.topology.clone(), self.channel.clone()))
+        Ok(Queue::new(
+            id,
+            self.topology.clone(),
+            self.channel.clone(),
+            Arc::downgrade(&self.connection),
+            self.codec.clone(),
+        ))
     }
 
     /// Publish a serialized message to an exchange with the given routing key.
@@ -165,21 +161,6 @@ impl<C: Codec> Client<C> {
             .basic_publish(exchange, routing_key, encoded, props)
             .await
     }
-
-    /// Start consuming messages from a queue, returning a [`TypedConsumer`] that
-    /// decodes each message body using the client's codec.
-    pub async fn consume<T: serde::de::DeserializeOwned + 'static>(
-        &self,
-        queue: &str,
-        consumer_tag: &str,
-        opts: ConsumeOpts,
-    ) -> Result<TypedConsumer<T, C>, Error> {
-        let consumer = self
-            .channel
-            .basic_consume(queue, consumer_tag, opts)
-            .await?;
-        Ok(TypedConsumer::new(consumer, self.codec.clone()))
-    }
 }
 
 /// Builder for constructing a [`Client`].
@@ -190,7 +171,6 @@ impl<C: Codec> Client<C> {
 pub struct ClientBuilder<C: Codec = ByteCodec> {
     config: Config,
     codec: Arc<C>,
-    setup: Option<SetupFn>,
 }
 
 impl<C: Codec> ClientBuilder<C> {
@@ -200,29 +180,7 @@ impl<C: Codec> ClientBuilder<C> {
         ClientBuilder {
             config: self.config,
             codec: Arc::new(codec),
-            setup: self.setup,
         }
-    }
-
-    /// Set a setup function that runs after connecting.
-    ///
-    /// Use this to declare queues, exchanges, bindings, QoS, etc.
-    ///
-    /// ```ignore
-    /// .setup(|channel| Box::pin(async move {
-    ///     channel.queue_declare("my-queue", QueueDeclareOpts::default()).await?;
-    ///     Ok(())
-    /// }))
-    /// ```
-    pub fn setup<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&Channel) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.setup = Some(Box::new(f));
-        self
     }
 
     /// Build and connect the client.
@@ -234,15 +192,11 @@ impl<C: Codec> ClientBuilder<C> {
         debug!("connecting to AMQP broker");
         let connection = Connection::connect_with_config(self.config).await?;
         let channel = Arc::new(connection.open_channel().await?);
-
-        if let Some(setup) = self.setup {
-            setup(&channel).await?;
-        }
         info!("connected to AMQP broker");
 
         Ok(Client {
             codec: self.codec,
-            _connection: connection,
+            connection: Arc::new(connection),
             channel,
             topology: Arc::default(),
         })

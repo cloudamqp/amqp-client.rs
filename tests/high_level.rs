@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use amqp_client_rs::{
-    BasicProperties, Client, Codec, Connection, ConsumeOpts, Error, ExchangeDeclareOpts,
-    ExchangeKind, QueueDeclareOpts, QueueDeleteOpts,
+    BasicProperties, Client, Codec, Connection, Error, ExchangeDeclareOpts, ExchangeKind,
+    QueueDeclareOpts, QueueDeleteOpts, SubscribeOpts, TypedConsumer, TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,54 +50,50 @@ fn queue_name(label: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Build a Client with JsonCodec, declare a queue in the setup closure,
-/// publish a typed struct, consume it, verify the body, and ack.
-#[tokio::test]
-async fn client_publish_and_consume() {
-    let queue = queue_name("pub-consume");
-    let queue_clone = queue.clone();
-
-    let client = Client::builder(AMQP_URI)
+async fn json_client() -> Client<JsonCodec> {
+    Client::builder(AMQP_URI)
         .unwrap()
         .codec(JsonCodec)
-        .setup(move |channel| {
-            let q = queue_clone.clone();
-            Box::pin(async move {
-                channel
-                    .queue_declare(&q, QueueDeclareOpts::default())
-                    .await?;
-                Ok(())
-            })
-        })
         .build()
         .await
-        .unwrap();
+        .unwrap()
+}
 
-    let msg = Greeting {
+async fn next_within<T: serde::de::DeserializeOwned + 'static>(
+    consumer: &mut TypedConsumer<T, JsonCodec>,
+    timeout: Duration,
+) -> Option<TypedDelivery<T>> {
+    tokio::time::timeout(timeout, consumer.next())
+        .await
+        .ok()
+        .flatten()
+}
+
+fn greeting(value: u32) -> Greeting {
+    Greeting {
         name: "world".into(),
-        value: 42,
-    };
+        value,
+    }
+}
 
-    client.publish("", &queue, &msg).await.unwrap();
+/// Publish a typed struct to a declared queue, subscribe, verify the body,
+/// and ack.
+#[tokio::test]
+async fn client_publish_and_subscribe() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
 
-    let mut consumer = client
-        .consume::<Greeting>(&queue, "hl-pub-consume", ConsumeOpts::default())
+    client.publish("", &q.name(), &greeting(42)).await.unwrap();
+
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
         .await
         .unwrap();
-
-    let delivery = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+    let delivery = next_within(&mut consumer, Duration::from_secs(5))
         .await
-        .expect("timed out waiting for message")
-        .expect("consumer returned None");
-
-    assert_eq!(delivery.body, msg);
+        .expect("no message");
+    assert_eq!(delivery.body, greeting(42));
     delivery.ack().unwrap();
-
-    // Cleanup
-    let ch = client.channel();
-    ch.queue_delete(&queue, QueueDeleteOpts::default())
-        .await
-        .unwrap();
 }
 
 /// Publish with custom BasicProperties (correlation_id), verify both
@@ -105,120 +101,87 @@ async fn client_publish_and_consume() {
 /// message.
 #[tokio::test]
 async fn client_publish_with_props() {
-    let queue = queue_name("pub-props");
-    let queue_clone = queue.clone();
-
-    let client = Client::builder(AMQP_URI)
-        .unwrap()
-        .codec(JsonCodec)
-        .setup(move |channel| {
-            let q = queue_clone.clone();
-            Box::pin(async move {
-                channel
-                    .queue_declare(&q, QueueDeclareOpts::default())
-                    .await?;
-                Ok(())
-            })
-        })
-        .build()
-        .await
-        .unwrap();
-
-    let msg = Greeting {
-        name: "props-test".into(),
-        value: 99,
-    };
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
 
     let props = BasicProperties::builder()
         .correlation_id("corr-abc-123")
         .build()
         .unwrap();
-
     client
-        .publish_with_props("", &queue, &msg, props)
+        .publish_with_props("", &q.name(), &greeting(99), props)
         .await
         .unwrap();
 
-    let mut consumer = client
-        .consume::<Greeting>(&queue, "hl-pub-props", ConsumeOpts::default())
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
         .await
         .unwrap();
-
-    let delivery = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+    let delivery = next_within(&mut consumer, Duration::from_secs(5))
         .await
-        .expect("timed out waiting for message")
-        .expect("consumer returned None");
+        .expect("no message");
+    assert_eq!(delivery.body, greeting(99));
 
-    assert_eq!(delivery.body, msg);
-
-    // content_type should have been set by the codec
     let ct = delivery.properties.content_type.as_ref().unwrap();
     assert_eq!(ct.as_str().unwrap(), "application/json");
-
-    // correlation_id should be preserved from the custom props
     let corr = delivery.properties.correlation_id.as_ref().unwrap();
     assert_eq!(corr.as_str().unwrap(), "corr-abc-123");
-
     delivery.ack().unwrap();
-
-    // Cleanup
-    let ch = client.channel();
-    ch.queue_delete(&queue, QueueDeleteOpts::default())
-        .await
-        .unwrap();
 }
 
-/// The setup closure declares a queue; this test verifies that publishing
-/// works, which proves the setup ran and the queue exists.
+/// With prefetch 1, the second message arrives only after the first is acked.
 #[tokio::test]
-async fn client_setup_closure_runs() {
-    let queue = queue_name("setup-runs");
-    let queue_clone = queue.clone();
+async fn subscribe_applies_prefetch() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client.publish("", &q.name(), &greeting(1)).await.unwrap();
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
 
-    let client = Client::builder(AMQP_URI)
-        .unwrap()
-        .codec(JsonCodec)
-        .setup(move |channel| {
-            let q = queue_clone.clone();
-            Box::pin(async move {
-                channel
-                    .queue_declare(&q, QueueDeclareOpts::default())
-                    .await?;
-                Ok(())
-            })
-        })
-        .build()
-        .await
-        .unwrap();
-
-    // If the setup didn't run, publishing to a non-existent queue would not
-    // necessarily error on the default exchange; but consuming would fail.
-    // We publish then consume to confirm the queue was declared by setup.
-    let msg = Greeting {
-        name: "setup".into(),
-        value: 1,
+    let opts = SubscribeOpts {
+        prefetch: 1,
+        ..Default::default()
     };
+    let mut consumer = q.subscribe::<Greeting>(opts).await.unwrap();
+    let first = next_within(&mut consumer, Duration::from_secs(5))
+        .await
+        .expect("no first message");
+    assert!(
+        next_within(&mut consumer, Duration::from_millis(200))
+            .await
+            .is_none()
+    );
 
-    client.publish("", &queue, &msg).await.unwrap();
+    first.ack().unwrap();
+    let second = next_within(&mut consumer, Duration::from_secs(5))
+        .await
+        .expect("no second message");
+    assert_eq!(second.body, greeting(2));
+}
 
-    let mut consumer = client
-        .consume::<Greeting>(&queue, "hl-setup-check", ConsumeOpts::default())
+#[test]
+fn subscribe_opts_default_prefetch_is_20() {
+    assert_eq!(SubscribeOpts::default().prefetch, 20);
+}
+
+/// A caller-set consumer tag is used; without one the broker assigns one.
+#[tokio::test]
+async fn subscribe_uses_the_given_consumer_tag() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+
+    let opts = SubscribeOpts {
+        consumer_tag: Some("my-tag".into()),
+        ..Default::default()
+    };
+    let tagged = q.subscribe::<Greeting>(opts).await.unwrap();
+    assert_eq!(tagged.tag(), "my-tag");
+
+    let untagged = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
         .await
         .unwrap();
-
-    let delivery = tokio::time::timeout(Duration::from_secs(5), consumer.next())
-        .await
-        .expect("timed out waiting for message")
-        .expect("consumer returned None");
-
-    assert_eq!(delivery.body.name, "setup");
-    delivery.ack().unwrap();
-
-    // Cleanup
-    let ch = client.channel();
-    ch.queue_delete(&queue, QueueDeleteOpts::default())
-        .await
-        .unwrap();
+    assert!(!untagged.tag().is_empty());
+    assert_ne!(untagged.tag(), "my-tag");
 }
 
 /// Connect to an unreachable host. The new high-level Client does not retry

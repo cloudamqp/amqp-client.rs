@@ -1,4 +1,4 @@
-use amqp_client_rs::{Client, ConsumeOpts, QueueDeclareOpts};
+use amqp_client_rs::{Client, QueueDeclareOpts, SubscribeOpts};
 use serde::{Deserialize, Serialize};
 
 // Bring your own codec (e.g. JSON via serde_json)
@@ -31,33 +31,29 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
     // build() does a single connection attempt — no built-in retry.
     let client = Client::builder("amqp://guest:guest@localhost")?
         .codec(JsonCodec)
-        .setup(|ch| {
-            Box::pin(async move {
-                ch.queue_declare("my-queue", QueueDeclareOpts::default())
-                    .await?;
-                Ok(())
-            })
-        })
         .build()
+        .await?;
+
+    let queue = client
+        .queue("my-queue", QueueDeclareOpts::default())
         .await?;
 
     client
         .publish(
             "",
-            "my-queue",
+            &queue.name(),
             &MyMessage {
                 text: "hello".into(),
             },
         )
         .await?;
 
-    let mut consumer = client
-        .consume::<MyMessage>("my-queue", "my-consumer", ConsumeOpts::default())
+    let mut consumer = queue
+        .subscribe::<MyMessage>(SubscribeOpts::default())
         .await?;
 
-    // The Client does not recover from connection drops. When next() returns
-    // None, the consumer is done — inspect the underlying Consumer's
-    // cancellation reason if you need to react.
+    // The Client does not recover from connection drops yet. When next()
+    // returns None, the consumer is done.
     while let Some(delivery) = consumer.next().await {
         println!("Received: {:?}", delivery.body);
         delivery.ack()?;

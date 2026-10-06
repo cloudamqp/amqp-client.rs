@@ -4,31 +4,62 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::codec::Codec;
+use crate::client::channel::Channel;
 use crate::client::consumer::Consumer;
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
+use crate::protocol::table::Table;
+
+/// Options for [`Queue::subscribe`](super::queue::Queue::subscribe).
+#[derive(Clone, Debug)]
+pub struct SubscribeOpts {
+    /// Unacked messages the broker sends at most (`basic.qos`). Default 20.
+    pub prefetch: u16,
+    /// Consumer tag; reused on every recovery. `None` lets the broker
+    /// assign one.
+    pub consumer_tag: Option<String>,
+    pub no_ack: bool,
+    pub exclusive: bool,
+    pub arguments: Table,
+}
+
+impl Default for SubscribeOpts {
+    fn default() -> Self {
+        Self {
+            prefetch: 20,
+            consumer_tag: None,
+            no_ack: false,
+            exclusive: false,
+            arguments: Table::default(),
+        }
+    }
+}
 
 /// A typed consumer that decodes messages using a [`Codec`].
 ///
-/// Created by [`Client::consume`](super::client::Client::consume). Messages that fail
-/// to decode are automatically nacked (requeue=false) and skipped.
+/// Created by [`Queue::subscribe`](super::queue::Queue::subscribe), on a
+/// channel of its own. Messages that fail to decode are automatically nacked
+/// (requeue=false) and skipped.
 pub struct TypedConsumer<T, C: Codec> {
     inner: Consumer,
+    /// Owned so the consumer's channel lives exactly as long as it does.
+    _channel: Channel,
     codec: Arc<C>,
     _phantom: PhantomData<T>,
 }
 
 impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
-    pub(crate) fn new(inner: Consumer, codec: Arc<C>) -> Self {
+    pub(crate) fn new(inner: Consumer, channel: Channel, codec: Arc<C>) -> Self {
         Self {
             inner,
+            _channel: channel,
             codec,
             _phantom: PhantomData,
         }
     }
 
-    /// Returns the consumer tag assigned by the broker.
+    /// Returns the consumer tag.
     pub fn tag(&self) -> &str {
         self.inner.tag()
     }
