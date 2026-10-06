@@ -135,7 +135,7 @@ impl<T, C: Codec> TypedConsumer<T, C> {
             .queue
             .client()
             .ok()
-            .and_then(|c| c.recovery().map(|r| r.timeout))
+            .and_then(|c| c.recovery().map(|r| r.retry_delay()))
         else {
             return false;
         };

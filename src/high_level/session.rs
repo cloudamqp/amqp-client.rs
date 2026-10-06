@@ -238,7 +238,7 @@ async fn recover(client: Weak<ClientInner>) {
             let timeout = inner
                 .recovery
                 .as_ref()
-                .map_or(Duration::ZERO, |r| r.timeout);
+                .map_or(Duration::ZERO, RecoveryConfig::retry_delay);
             (
                 inner.config.clone(),
                 inner.topology.clone(),

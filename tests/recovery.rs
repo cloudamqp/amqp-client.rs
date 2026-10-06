@@ -423,3 +423,33 @@ async fn an_ended_consumer_is_not_recovery_demand() {
     assert_eq!(proxy.accepted(), attempts, "recovery kept reconnecting");
     drop(consumer);
 }
+
+/// A zero recovery timeout must not turn recovery into a tight connect loop.
+#[tokio::test]
+async fn a_zero_timeout_does_not_spin() {
+    let proxy = Proxy::start().await;
+    let client = Client::builder(&proxy.uri())
+        .unwrap()
+        .recovery(RecoveryConfig {
+            timeout: Duration::ZERO,
+        })
+        .build()
+        .await
+        .unwrap();
+    let q = client
+        .queue(&name("zero"), QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    proxy.set_down(true);
+    proxy.cut();
+    let next = tokio::spawn(async move { consumer.next().await });
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let attempts = proxy.accepted();
+    assert!(attempts <= 15, "{attempts} connect attempts in 1 s");
+    next.abort();
+}
