@@ -17,9 +17,9 @@ Low-level usage is near-identical; high-level usage diverges.
 | Ack | `msg.ack()` | `d.Ack()` |
 | Confirms (low) | `confirm_select()` + `basic_publish_confirmed` | `BasicPublishConfirm` → `conf.Wait(ctx)`, `WaitForConfirms` |
 | Returns | `ch.returns()` stream | `ch.OnReturn(callback)` |
-| Fluent wrappers | `ch.queue(name)` / `ch.exchange(name)` (low level); high level `client.queue(..)`, `client.topic(..)` etc. planned (ADR-0002) | `c.Queue(...)`, `c.TopicExchange(...)` (high level, owned by `Client`) |
-| High-level build | `Client::builder(uri)?.codec(..).setup(..).build()` | `amqp.NewClient(ctx, uri, &ClientOptions{...})` |
-| High-level consume | `client.consume::<T>(q, tag, opts)` → pull `next()` | `q.Subscribe(ctx, handler, opts)` → push handler |
+| Fluent wrappers | `client.queue(..)`, `client.topic(..)` etc. (high level, owned by `Client`); `low_level::{Queue, Exchange}` via `ch.queue(name)` | `c.Queue(...)`, `c.TopicExchange(...)` (high level, owned by `Client`) |
+| High-level build | `Client::builder(uri)?.codec(..).build()` | `amqp.NewClient(ctx, uri, &ClientOptions{...})` |
+| High-level consume | `q.subscribe::<T>(SubscribeOpts)` on its own channel → pull `next()` | `q.Subscribe(ctx, handler, opts)` → push handler |
 
 Cancellation/timeouts: Go passes a `context.Context` to every blocking call;
 amqp-client.rs uses config-wide `connect_timeout` / `rpc_timeout` (callers can wrap in
@@ -35,13 +35,13 @@ amqp-client.rs uses config-wide `connect_timeout` / `rpc_timeout` (callers can w
 | Recovery trigger | Operation-driven (ADR-0002) | Background supervisor reconnects as soon as `conn.Done()` fires |
 | Retry wait | Fixed `RecoveryConfig::timeout` (250ms), no backoff | Exponential: 1s doubling to 30s; first retry immediate |
 | Give up | Never | `MaxRetries` (0 = never), then `OnFailed` |
-| Topology restore | Recorded topology, as in Go (ADR-0002); `setup` closure removed | Declarative: records queues/exchanges/bindings declared via `Client` and redeclares them; server-named queues get a new name, `Queue.Name()` updates |
+| Topology restore | Recorded topology, as in Go (ADR-0002); recorded today, redeclared once recovery lands | Declarative: records queues/exchanges/bindings declared via `Client` and redeclares them; server-named queues get a new name, `Queue.Name()` updates |
 | Channel-close recovery | Consumers recover after `ChannelClosed` and `ServerCancel` (ADR-0002) | Subscriptions re-consume after channel close too (e.g. consumer timeout) |
 | Waits during recovery | Bounded by `RecoveryConfig::timeout`, then `ConnectionClosed` | Bounded by caller's `ctx` |
 | Lifecycle hooks | None | `OnConnect`, `OnDisconnect`, `OnFailed`, `OnReturn` |
 | Publish | Fire-and-forget, transient by default | Persistent and confirmed by default; pipelined confirms; retries transparently if channel closed before send |
 | Mandatory / returns | Only low level | `Message.Mandatory` + `OnReturn` |
-| Consume model | Pull: `TypedConsumer::next()`, caller acks | Push: handler; acks on `nil`, requeues on error/panic; `Workers` for concurrency; default prefetch 20 |
+| Consume model | Pull: `TypedConsumer::next()`, caller acks; default prefetch 20 | Push: handler; acks on `nil`, requeues on error/panic; `Workers` for concurrency; default prefetch 20 |
 | Decode failure | Auto-nack (no requeue), skipped | Handler calls `d.Decode`, decides itself |
 | Codecs | One `Codec` per client, compile-time typed (serde); bring your own (only `ByteCodec` built in) | Registry by `content-type` + `content-encoding`; built-in JSON, text, gzip, deflate; dynamic (`any`) |
 | RPC | None | `RPCServer`, `RPCCall`, `RPCClient` over direct reply-to |

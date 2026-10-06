@@ -8,7 +8,8 @@ An AMQP 0-9-1 client library for Rust, built on [tokio](https://tokio.rs).
 - TLS via [rustls](https://github.com/rustls/rustls) (`amqps://`)
 - Async/await with tokio
 - Clean two-layer architecture: runtime-agnostic protocol layer + tokio client layer
-- Fluent API with `Queue` and `Exchange` wrappers
+- High-level `Client`: typed messages via a `Codec`, `Exchange`/`Queue` handles, one channel per consumer
+- Low-level fluent wrappers in `amqp_client_rs::low_level`
 
 ## Quick Start
 
@@ -74,6 +75,39 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
     Ok(())
 }
 ```
+
+### High-level client
+
+```rust
+use amqp_client_rs::{Client, ExchangeDeclareOpts, QueueDeclareOpts, SubscribeOpts};
+
+// `JsonCodec` is your own `Codec`, e.g. over serde_json (see examples/high_level.rs).
+async fn run() -> Result<(), amqp_client_rs::Error> {
+    let client = Client::builder("amqp://guest:guest@localhost")?
+        .codec(JsonCodec)
+        .build()
+        .await?;
+
+    let orders = client.topic("orders", ExchangeDeclareOpts::default()).await?;
+    let queue = client.queue("order-events", QueueDeclareOpts::default()).await?;
+    queue.bind(&orders, "order.*").await?;   // or by name: queue.bind("amq.topic", ..)
+
+    client.publish(orders.name(), "order.created", &"order 42").await?;
+
+    let mut consumer = queue
+        .subscribe::<String>(SubscribeOpts { prefetch: 50, ..Default::default() })
+        .await?;
+    while let Some(delivery) = consumer.next().await {
+        println!("Received: {}", delivery.body);
+        delivery.ack()?;
+    }
+    Ok(())
+}
+```
+
+The client records the exchanges, queues and bindings declared through it;
+automatic recovery that declares them again is designed in
+[ADR-0002](docs/adr/0002-recorded-topology-and-recovery.md) but not built yet.
 
 ## Requirements
 
