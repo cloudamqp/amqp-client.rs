@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use amqp_client_rs::{
-    BasicProperties, Client, Codec, ConsumeOpts, Error, QueueDeclareOpts, QueueDeleteOpts,
+    BasicProperties, Client, Codec, Connection, ConsumeOpts, Error, ExchangeDeclareOpts,
+    ExchangeKind, QueueDeclareOpts, QueueDeleteOpts,
 };
 use serde::{Deserialize, Serialize};
 
@@ -234,4 +235,53 @@ async fn client_build_fails_fast_on_unreachable_host() {
         result.is_err(),
         "expected build() to fail for unreachable host"
     );
+}
+
+/// Each exchange shorthand declares an exchange of its kind: redeclaring with
+/// the same kind is accepted, a different kind is refused.
+#[tokio::test]
+async fn client_declares_exchanges_of_each_kind() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let opts = ExchangeDeclareOpts::default;
+    let name = |label: &str| queue_name(&format!("ex-{label}"));
+
+    let declared = [
+        (client.direct(&name("direct"), opts()).await, "direct"),
+        (client.fanout(&name("fanout"), opts()).await, "fanout"),
+        (client.topic(&name("topic"), opts()).await, "topic"),
+        (client.headers(&name("headers"), opts()).await, "headers"),
+        (
+            client
+                .exchange(
+                    &name("x-consistent-hash"),
+                    ExchangeKind::Custom("x-consistent-hash".into()),
+                    opts(),
+                )
+                .await,
+            "x-consistent-hash",
+        ),
+    ]
+    .map(|(exchange, kind)| (exchange.unwrap(), kind));
+
+    for (exchange, kind) in &declared {
+        assert_eq!(exchange.name(), name(kind));
+        let ch = conn.open_channel().await.unwrap();
+        ch.exchange_declare(exchange.name(), kind, opts())
+            .await
+            .unwrap();
+        let other = if *kind == "fanout" {
+            "direct"
+        } else {
+            "fanout"
+        };
+        let ch = conn.open_channel().await.unwrap();
+        let refused = ch.exchange_declare(exchange.name(), other, opts()).await;
+        assert!(refused.is_err());
+    }
+
+    let ch = conn.open_channel().await.unwrap();
+    for (exchange, _) in &declared {
+        ch.exchange_delete(exchange.name(), false).await.unwrap();
+    }
 }

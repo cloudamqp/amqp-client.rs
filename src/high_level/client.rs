@@ -1,12 +1,14 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, info};
 
 use super::codec::{ByteCodec, Codec};
 use super::consumer::TypedConsumer;
-use crate::client::channel::{Channel, ConsumeOpts};
+use super::exchange::{Exchange, ExchangeKind};
+use super::topology::Topology;
+use crate::client::channel::{Channel, ConsumeOpts, ExchangeDeclareOpts};
 use crate::client::config::Config;
 use crate::client::connection::Connection;
 use crate::error::Error;
@@ -39,6 +41,7 @@ pub struct Client<C: Codec = ByteCodec> {
     /// Only used via `Drop`, no methods called.
     _connection: Connection,
     channel: Arc<Channel>,
+    topology: Arc<Mutex<Topology>>,
 }
 
 impl Client<ByteCodec> {
@@ -64,6 +67,44 @@ impl<C: Codec> Client<C> {
     /// (e.g. `queue_delete`, `queue_purge`, transactions).
     pub fn channel(&self) -> Arc<Channel> {
         self.channel.clone()
+    }
+
+    /// Declare an exchange and record it, so it is declared again after
+    /// recovery.
+    pub async fn exchange(
+        &self,
+        name: &str,
+        kind: ExchangeKind,
+        opts: ExchangeDeclareOpts,
+    ) -> Result<Exchange, Error> {
+        self.channel
+            .exchange_declare(name, kind.as_str(), opts.clone())
+            .await?;
+        self.topology
+            .lock()
+            .unwrap()
+            .record_exchange(name, kind.as_str(), opts);
+        Ok(Exchange::new(name))
+    }
+
+    /// Declare a direct exchange. See [`Client::exchange`].
+    pub async fn direct(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+        self.exchange(name, ExchangeKind::Direct, opts).await
+    }
+
+    /// Declare a fanout exchange. See [`Client::exchange`].
+    pub async fn fanout(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+        self.exchange(name, ExchangeKind::Fanout, opts).await
+    }
+
+    /// Declare a topic exchange. See [`Client::exchange`].
+    pub async fn topic(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+        self.exchange(name, ExchangeKind::Topic, opts).await
+    }
+
+    /// Declare a headers exchange. See [`Client::exchange`].
+    pub async fn headers(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+        self.exchange(name, ExchangeKind::Headers, opts).await
     }
 
     /// Publish a serialized message to an exchange with the given routing key.
@@ -190,6 +231,7 @@ impl<C: Codec> ClientBuilder<C> {
             codec: self.codec,
             _connection: connection,
             channel,
+            topology: Arc::default(),
         })
     }
 }
