@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, Weak};
 use super::codec::{ByteCodec, Codec};
 use super::consumer::{SubscribeOpts, TypedConsumer};
 use super::topology::{QueueId, Topology};
-use crate::client::channel::{Channel, ConsumeOpts};
+use crate::client::channel::{Channel, ConsumeOpts, QueueDeleteOpts};
 use crate::client::connection::Connection;
 use crate::error::Error;
 use crate::protocol::table::Table;
@@ -108,6 +108,15 @@ impl<C: Codec> Queue<C> {
         let tag = opts.consumer_tag.as_deref().unwrap_or("");
         let consumer = channel.basic_consume(&self.name(), tag, consume).await?;
         Ok(TypedConsumer::new(consumer, channel, self.codec.clone()))
+    }
+
+    /// Delete the queue and forget it and its bindings, so recovery does not
+    /// declare it again. Its consumers end. Returns the number of messages
+    /// deleted.
+    pub async fn delete(&self, opts: QueueDeleteOpts) -> Result<u32, Error> {
+        let count = self.channel.queue_delete(&self.name(), opts).await?;
+        self.topology.lock().unwrap().forget_queue(self.id);
+        Ok(count)
     }
 
     /// Remove a binding and forget it.

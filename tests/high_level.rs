@@ -351,3 +351,31 @@ async fn queue_binds_by_exchange_name() {
     client.publish("amq.topic", &key, &vec![1u8]).await.unwrap();
     assert!(has_message(&client, &q.name()).await);
 }
+
+/// Deleting a queue through its handle removes it on the broker and ends its
+/// consumers.
+#[tokio::test]
+async fn queue_delete_ends_its_consumers() {
+    let client = json_client().await;
+    let name = queue_name("delete");
+    let q = client
+        .queue(&name, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+    let passive = QueueDeclareOpts {
+        passive: true,
+        ..Default::default()
+    };
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    assert!(ch.queue_declare(&name, passive).await.is_err());
+}
