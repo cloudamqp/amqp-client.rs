@@ -53,12 +53,7 @@ impl MessageHandle {
         // Acking on a channel the broker closed is a connection error.
         check_open(self.channel_id, &self.closed)?;
         self.shared
-            .frame_tx
             .send(OutgoingFrame::Frame(Frame::Method(self.channel_id, method)))
-            .map_err(|_| Error::ConnectionClosed {
-                code: 0,
-                reason: "connection closed".into(),
-            })
     }
 }
 
@@ -161,6 +156,7 @@ mod tests {
             publish_admission_capacity: 1,
             id_alloc: Mutex::new(ChannelIdAllocator::new(1)),
             dead: tokio::sync::Notify::new(),
+            lost: std::sync::atomic::AtomicBool::new(false),
         });
         (MessageHandle::new(7, shared, ClosedState::default()), rx)
     }

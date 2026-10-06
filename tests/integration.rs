@@ -612,3 +612,42 @@ async fn operations_on_a_broker_closed_channel_fail_fast() {
         .await
         .unwrap();
 }
+
+/// Once the connection is known to be gone, publishing fails at once instead
+/// of queueing frames for a dead socket.
+#[tokio::test]
+async fn publish_fails_once_the_connection_is_gone() {
+    let proxy = support::proxy::Proxy::start().await;
+    let conn = Connection::connect(&proxy.uri()).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    let ok = ch
+        .queue_declare(
+            "",
+            QueueDeclareOpts {
+                exclusive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut consumer = ch
+        .basic_consume(&ok.queue, "", ConsumeOpts::default())
+        .await
+        .unwrap();
+
+    proxy.cut();
+    // The consumer ending shows the reader has seen the connection close.
+    let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+
+    let published = ch
+        .basic_publish("", &ok.queue, b"x".to_vec(), BasicProperties::default())
+        .await;
+    assert!(
+        matches!(
+            published,
+            Err(amqp_client_rs::Error::ConnectionClosed { .. })
+        ),
+        "publish after connection loss: {published:?}"
+    );
+}

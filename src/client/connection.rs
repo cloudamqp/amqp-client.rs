@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -119,9 +119,32 @@ pub(crate) struct ConnectionShared {
     /// Notified when the peer is considered dead (heartbeat timeout); stops
     /// the reader task.
     pub(crate) dead: tokio::sync::Notify,
+    /// Set once the connection is gone (reader stopped, or `Connection`
+    /// dropped): sends then fail at once instead of queueing for a dead
+    /// socket.
+    pub(crate) lost: AtomicBool,
 }
 
 impl ConnectionShared {
+    /// Queues `item` for the writer, or fails with `ConnectionClosed` if the
+    /// connection is gone.
+    pub(crate) fn send(&self, item: OutgoingFrame) -> Result<(), Error> {
+        let closed = || Error::ConnectionClosed {
+            code: 0,
+            reason: "connection closed".into(),
+        };
+        if self.lost.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        self.frame_tx.send(item).map_err(|_| closed())
+    }
+
+    /// Marks the connection gone and stops the writer.
+    fn mark_lost(&self) {
+        self.lost.store(true, Ordering::Release);
+        let _ = self.frame_tx.send(OutgoingFrame::Shutdown);
+    }
+
     /// Sends `Channel.Close` for `channel_id` without waiting. The reader task
     /// frees the id when the broker's `CloseOk` arrives; if the connection is
     /// already gone, the id is freed now.
@@ -418,6 +441,7 @@ impl Connection {
             publish_admission_capacity,
             id_alloc,
             dead: tokio::sync::Notify::new(),
+            lost: AtomicBool::new(false),
         });
 
         // Channel registry shared between Connection and reader task
@@ -438,6 +462,7 @@ impl Connection {
         let reader_senders = channel_senders.clone();
         let reader_shared = shared.clone();
         let reader_last_recv = last_recv.clone();
+        let lost_shared = shared.clone();
         let reader_task = tokio::spawn(async move {
             reader_loop(
                 read_half,
@@ -449,9 +474,10 @@ impl Connection {
                 post_tune_cap,
             )
             .await;
-            // The connection is gone: dropping every channel's sender ends
-            // its dispatch task, which ends its consumers with
-            // `ConnectionClosed`.
+            // The connection is gone: later sends fail, and dropping every
+            // channel's sender ends its dispatch task, which ends its
+            // consumers with `ConnectionClosed`.
+            lost_shared.mark_lost();
             reader_senders.lock().unwrap().clear();
         });
 
@@ -496,13 +522,7 @@ impl Connection {
 
         // Send Channel.Open
         let frame = Frame::Method(channel_id, MethodFrame::ChannelOpen);
-        self.shared
-            .frame_tx
-            .send(OutgoingFrame::Frame(frame))
-            .map_err(|_| Error::ConnectionClosed {
-                code: 0,
-                reason: "connection write channel closed".into(),
-            })?;
+        self.shared.send(OutgoingFrame::Frame(frame))?;
 
         // Wait for Channel.OpenOk
         let mut incoming_rx = incoming_rx;
@@ -564,13 +584,7 @@ impl Connection {
                 method_id: 0,
             }),
         );
-        self.shared
-            .frame_tx
-            .send(OutgoingFrame::Frame(close))
-            .map_err(|_| Error::ConnectionClosed {
-                code: 0,
-                reason: "connection already closed".into(),
-            })?;
+        self.shared.send(OutgoingFrame::Frame(close))?;
 
         // Wait for Connection.CloseOk from the server
         let mut conn_frames_rx = self.conn_frames_rx.lock().await;
@@ -633,6 +647,7 @@ impl Drop for Connection {
         self.reader_task.abort();
         // Aborting the reader skips its cleanup: end every channel here, so
         // their consumers end with `ConnectionClosed`.
+        self.shared.lost.store(true, Ordering::Release);
         self.channel_senders.lock().unwrap().clear();
         if let Some(ref hb) = self.heartbeat_task {
             hb.abort();

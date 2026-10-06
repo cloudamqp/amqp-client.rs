@@ -853,6 +853,13 @@ impl Channel {
         self.await_flow_active().await?;
         let permit = self.acquire_publish_permits(body.len()).await?;
 
+        let method = MethodFrame::BasicPublish(basic_method::Publish {
+            exchange: ShortStr::try_from(exchange).map_err(Error::Protocol)?,
+            routing_key: ShortStr::try_from(routing_key).map_err(Error::Protocol)?,
+            mandatory,
+            immediate: false,
+        });
+
         // Allocate sequence number, register oneshot, send frames. Take and
         // release the confirms_state lock around the registration only — we
         // must not hold it across the awaits below.
@@ -868,27 +875,30 @@ impl Channel {
             (delivery_tag, rx)
         };
 
-        let method = MethodFrame::BasicPublish(basic_method::Publish {
-            exchange: ShortStr::try_from(exchange).map_err(Error::Protocol)?,
-            routing_key: ShortStr::try_from(routing_key).map_err(Error::Protocol)?,
-            mandatory,
-            immediate: false,
-        });
-
-        // From this point on, errors must un-register the oneshot or the
-        // BTreeMap leaks. Do encoding-fallible work *before* the registration
-        // (already done — only ShortStr conversion can fail and that's above).
-        self.send_frame(Frame::Method(self.id, method))?;
-        self.send_frame(Frame::Header(
-            self.id,
-            Box::new(ContentHeader {
-                class_id: 60,
-                body_size: body.len() as u64,
-                properties: props,
-            }),
-        ))?;
-
-        self.send_body_frames(body, permit)?;
+        // From here on, errors must un-register the oneshot or the BTreeMap
+        // leaks. A failed send means the broker got an incomplete message at
+        // most, which it never routes.
+        let sent = self
+            .send_frame(Frame::Method(self.id, method))
+            .and_then(|()| {
+                self.send_frame(Frame::Header(
+                    self.id,
+                    Box::new(ContentHeader {
+                        class_id: 60,
+                        body_size: body.len() as u64,
+                        properties: props,
+                    }),
+                ))
+            })
+            .and_then(|()| self.send_body_frames(body, permit));
+        if let Err(e) = sent {
+            self.confirms_state
+                .lock()
+                .unwrap()
+                .pending
+                .remove(&delivery_tag);
+            return Err(e);
+        }
 
         Ok(PublishConfirm { delivery_tag, rx })
     }
@@ -961,13 +971,7 @@ impl Channel {
 
     fn send_frame(&self, frame: Frame) -> Result<(), Error> {
         self.check_open()?;
-        self.shared
-            .frame_tx
-            .send(OutgoingFrame::Frame(frame))
-            .map_err(|_| Error::ConnectionClosed {
-                code: 0,
-                reason: "connection write channel closed".into(),
-            })
+        self.shared.send(OutgoingFrame::Frame(frame))
     }
 
     fn send_method(&self, method: MethodFrame) -> Result<(), Error> {
@@ -1075,13 +1079,7 @@ impl Channel {
             Some(p) => OutgoingFrame::FrameWithPermit(frame, p),
             None => OutgoingFrame::Frame(frame),
         };
-        self.shared
-            .frame_tx
-            .send(item)
-            .map_err(|_| Error::ConnectionClosed {
-                code: 0,
-                reason: "connection write channel closed".into(),
-            })
+        self.shared.send(item)
     }
 
     /// Send an RPC request and await its reply, with cancellation safety.
