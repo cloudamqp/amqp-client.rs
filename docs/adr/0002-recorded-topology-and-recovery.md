@@ -149,5 +149,6 @@ q.delete(QueueDeleteOpts::default()).await?;
 - **`Client` drop is the hard stop.** It ends recovery and drops the session;
   recoverable consumers eventually return `None` and never keep the client
   alive.
-- **High-level publisher confirms are out of scope** (see
-  `PUBLISH_CONFIRM_ISSUE.md`).
+- **Publisher confirms** are decided in ADR-0003: a confirmed publish is
+  retried on the recovered session only if it was never sent; recovery does
+  not invent confirm-retry semantics.

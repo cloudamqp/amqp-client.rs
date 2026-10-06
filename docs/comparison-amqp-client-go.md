@@ -39,7 +39,7 @@ amqp-client.rs uses config-wide `connect_timeout` / `rpc_timeout` (callers can w
 | Channel-close recovery | Consumers recover after `ChannelClosed` and `ServerCancel` (ADR-0002) | Subscriptions re-consume after channel close too (e.g. consumer timeout) |
 | Waits during recovery | Bounded by `RecoveryConfig::timeout`, then `ConnectionClosed` | Bounded by caller's `ctx` |
 | Lifecycle hooks | None | `OnConnect`, `OnDisconnect`, `OnFailed`, `OnReturn` |
-| Publish | Fire-and-forget, transient by default | Persistent and confirmed by default; pipelined confirms; retries transparently if channel closed before send |
+| Publish | `publish` fire-and-forget; `publish_confirmed` waits for the confirm (ADR-0003); transient unless props say otherwise; retried once if never sent | Persistent and confirmed by default; pipelined confirms; retries transparently if channel closed before send |
 | Mandatory / returns | Only low level | `Message.Mandatory` + `OnReturn` |
 | Consume model | Pull: `TypedConsumer::next()`, caller acks; default prefetch 20 | Push: handler; acks on `nil`, requeues on error/panic; `Workers` for concurrency; default prefetch 20 |
 | Decode failure | Auto-nack (no requeue), skipped | Handler calls `d.Decode`, decides itself |
@@ -75,7 +75,8 @@ sibling libraries (Go, Ruby, Crystal, JS) share one high-level API:
    in the background; amqp-client.rs waits for an operation to notice.
 2. **Fixed interval vs exponential backoff**, and no `MaxRetries` in amqp-client.rs.
 3. **Publish confirms.** Go's high-level publish is confirmed + persistent by
-   default; amqp-client.rs defers this (`PUBLISH_CONFIRM_ISSUE.md`).
+   default; amqp-client.rs makes confirms explicit (`publish_confirmed`) and
+   leaves persistence to the caller (ADR-0003).
 4. **Wait budget.** Go uses the caller's context; amqp-client.rs a single global
    `RecoveryConfig::timeout`.
 5. **No lifecycle hooks** (`OnConnect`/`OnDisconnect`/`OnFailed`) in amqp-client.rs.

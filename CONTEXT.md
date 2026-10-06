@@ -71,3 +71,7 @@ _Avoid_: Stable consumer identity
 **At-least-once delivery**:
 A delivery guarantee where a message may be delivered again if acknowledgement state is lost with an AMQP session.
 _Avoid_: Exactly-once delivery, client-side deduplication
+
+**Uncertain confirm**:
+The outcome of a confirmed publish that was sent but whose confirm never arrived, because the AMQP session was lost or the wait timed out; the broker may or may not have the message, and the client never republishes it on its own.
+_Avoid_: Failed publish, lost message

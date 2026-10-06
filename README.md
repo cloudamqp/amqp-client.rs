@@ -115,8 +115,14 @@ With `.recovery(RecoveryConfig::default())` on the builder
   (250 ms) for a new connection, then fails. Consumers carry on.
 - A consumer whose channel is closed (e.g. consumer timeout) or whose queue is
   deleted declares the queue and its bindings again and consumes again.
-- Unacked messages are redelivered, so make handlers idempotent. Publishes are
+- Unacked messages are redelivered, so make handlers idempotent. `publish` is
   not confirmed: one sent just as the connection drops can be lost.
+
+`publish_confirmed` returns once the broker has the message.
+`Error::PublishNacked` and `Error::ChannelClosed` mean it does not;
+`Error::ConfirmUncertain` means the connection was lost before the confirm
+arrived, so the broker may or may not have it
+([ADR-0003](docs/adr/0003-high-level-publisher-confirms.md)).
 
 `cargo run --example recovery` publishes and consumes a tick every second;
 restart the broker while it runs to watch it recover.
