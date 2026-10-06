@@ -5,7 +5,7 @@ use tracing::warn;
 use super::codec::Codec;
 use super::queue::Queue;
 use super::session::{ConsumerRegistration, session_after};
-use crate::client::channel::{Channel, QueueDeleteOpts};
+use crate::client::channel::Channel;
 use crate::client::consumer::{CancellationReason, Consumer};
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
@@ -159,22 +159,19 @@ impl<T, C: Codec> TypedConsumer<T, C> {
                     Err(_) => return false,
                 },
             };
-            match self.queue.redeclare_and_consume(&session, &self.opts).await {
-                Ok((channel, consumer, name)) if !self.queue.is_recorded() => {
-                    // Deleted through its handle while we declared it again:
-                    // undo that and end.
-                    drop(consumer);
-                    let _ = channel
-                        .queue_delete(&name, QueueDeleteOpts::default())
-                        .await;
-                    return false;
-                }
-                Ok((channel, consumer, _)) => {
+            // Not held while waiting for a session above: a delete must not
+            // wait on a recovery that waits on the broker.
+            let guard = self.queue.lock().await;
+            let recovered = self.queue.redeclare_and_consume(&session, &self.opts).await;
+            drop(guard);
+            match recovered {
+                Ok((channel, consumer)) => {
                     self.inner = consumer;
                     self._channel = channel;
                     self.generation = session.generation;
                     return true;
                 }
+                Err(Error::QueueDeleted { .. }) => return false,
                 Err(Error::ConnectionClosed { .. }) => lost_generation = Some(session.generation),
                 Err(e) => {
                     warn!(error = %e, "consumer recovery failed, retrying");

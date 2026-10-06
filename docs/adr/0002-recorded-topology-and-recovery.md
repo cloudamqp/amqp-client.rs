@@ -66,6 +66,12 @@ q.delete(QueueDeleteOpts::default()).await?;
   (`next()` returns `None`), so a deliberate delete is not undone by recovery.
   It is forgotten before the delete is sent (and restored if the delete
   fails), because the broker cancels the queue's consumers before it replies.
+  Operations on one queue (bind, unbind, subscribe, delete and its consumers'
+  recovery) are serialised by a per-queue lock, so none overlaps a delete.
+  After a delete the handle keeps its last name, but further operations fail
+  with `QueueDeleted` without reaching the broker (an empty queue name would
+  mean "the queue last declared on this channel" to it). A 404 from the
+  delete counts as success: the queue is gone either way.
 - Each recoverable consumer has its own channel and its own prefetch
   (`basic_qos`), so one consumer's `ChannelClosed` does not affect the others
   and QoS needs no setup hook.

@@ -17,6 +17,10 @@ pub struct Queue<C: Codec = ByteCodec> {
     /// Weak, so queue handles and consumers never keep the client alive.
     client: Weak<ClientInner>,
     codec: Arc<C>,
+    /// The queue's operation lock, shared by every handle to it.
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// The last name seen, so `name()` still answers once it is deleted.
+    last_name: Arc<Mutex<String>>,
 }
 
 impl<C: Codec> Clone for Queue<C> {
@@ -26,29 +30,54 @@ impl<C: Codec> Clone for Queue<C> {
             topology: self.topology.clone(),
             client: self.client.clone(),
             codec: self.codec.clone(),
+            lock: self.lock.clone(),
+            last_name: self.last_name.clone(),
         }
     }
 }
 
 impl<C: Codec> Queue<C> {
     pub(crate) fn new(id: QueueId, client: &Arc<ClientInner>, codec: Arc<C>) -> Self {
+        let (lock, name) = {
+            let topology = client.topology.lock().unwrap();
+            let queue = topology.queue(id).expect("queue just recorded");
+            (queue.lock.clone(), queue.name.clone())
+        };
         Self {
             id,
             topology: client.topology.clone(),
             client: Arc::downgrade(client),
             codec,
+            lock,
+            last_name: Arc::new(Mutex::new(name)),
         }
     }
 
     /// The queue's current name. For a server-named queue it changes when the
-    /// queue is declared again after recovery.
+    /// queue is declared again after recovery. After a delete it is the last
+    /// name the queue had.
     pub fn name(&self) -> String {
-        self.topology
-            .lock()
-            .unwrap()
-            .queue_name(self.id)
-            .unwrap_or_default()
-            .to_owned()
+        let mut last_name = self.last_name.lock().unwrap();
+        if let Some(name) = self.topology.lock().unwrap().queue_name(self.id) {
+            name.clone_into(&mut last_name);
+        }
+        last_name.clone()
+    }
+
+    /// The current name, or `QueueDeleted` once the queue was deleted through
+    /// a handle. Never `""`: the broker reads an empty queue name as "the
+    /// queue last declared on this channel".
+    fn recorded_name(&self) -> Result<String, Error> {
+        if self.is_recorded() {
+            Ok(self.name())
+        } else {
+            Err(Error::QueueDeleted { name: self.name() })
+        }
+    }
+
+    /// Takes the queue's operation lock.
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lock.lock().await
     }
 
     /// Bind the queue to an exchange, given as an [`Exchange`](crate::Exchange)
@@ -68,9 +97,11 @@ impl<C: Codec> Queue<C> {
         arguments: Table,
     ) -> Result<(), Error> {
         let exchange = exchange.as_ref();
+        let _guard = self.lock().await;
+        let name = self.recorded_name()?;
         self.client()?
             .with_session(|s| {
-                let (name, arguments) = (self.name(), arguments.clone());
+                let (name, arguments) = (name.clone(), arguments.clone());
                 async move {
                     s.channel()
                         .queue_bind(&name, exchange, routing_key, arguments)
@@ -92,9 +123,11 @@ impl<C: Codec> Queue<C> {
         opts: SubscribeOpts,
     ) -> Result<TypedConsumer<T, C>, Error> {
         let client = self.client()?;
+        let _guard = self.lock().await;
+        let name = self.recorded_name()?;
         let (generation, channel, consumer) = client
             .with_session(|s| {
-                let (name, opts) = (self.name(), opts.clone());
+                let (name, opts) = (name.clone(), opts.clone());
                 async move {
                     let channel = s.connection.open_channel().await?;
                     let consumer = consume_on(&channel, &name, &opts).await?;
@@ -115,19 +148,18 @@ impl<C: Codec> Queue<C> {
 
     /// Consumer-level recovery: on a new channel of `session`, declare the
     /// queue, the recorded exchanges its bindings use, and its bindings
-    /// again, then consume. Returns the name the queue was declared under.
+    /// again, then consume. The caller holds the queue's lock.
     pub(crate) async fn redeclare_and_consume(
         &self,
         session: &Session,
         opts: &SubscribeOpts,
-    ) -> Result<(Channel, Consumer, String), Error> {
+    ) -> Result<(Channel, Consumer), Error> {
         let (queue, bindings, exchanges) = {
             let topology = self.topology.lock().unwrap();
             let Some(queue) = topology.queue(self.id).cloned() else {
-                return Err(Error::ConnectionClosed {
-                    code: 0,
-                    reason: "queue deleted".into(),
-                });
+                // name() takes the topology lock itself.
+                drop(topology);
+                return Err(Error::QueueDeleted { name: self.name() });
             };
             let bindings: Vec<_> = topology.bindings_for(self.id).cloned().collect();
             // The recorded exchanges these bindings use; one may be gone too
@@ -150,7 +182,7 @@ impl<C: Codec> Queue<C> {
                 .await?;
         }
         let consumer = consume_on(&channel, &name, opts).await?;
-        Ok((channel, consumer, name))
+        Ok((channel, consumer))
     }
 
     /// Declares the queue again on a new channel. A server-named queue keeps
@@ -211,10 +243,12 @@ impl<C: Codec> Queue<C> {
     /// deleted.
     pub async fn delete(&self, opts: QueueDeleteOpts) -> Result<u32, Error> {
         let client = self.client()?;
-        let name = self.name();
-        // Forget it first: the broker cancels the queue's consumers before it
-        // replies, and they must not see it as still recorded and declare it
-        // again.
+        // Held throughout, so no other operation on this queue (including
+        // consumer recovery) overlaps the delete.
+        let _guard = self.lock().await;
+        let name = self.recorded_name()?;
+        // Forget it before sending: the broker cancels the queue's consumers
+        // before it replies, and they must not declare it again.
         let taken = self.topology.lock().unwrap().take_queue(self.id);
         let result = client
             .with_session(|s| {
@@ -222,12 +256,18 @@ impl<C: Codec> Queue<C> {
                 async move { s.channel().queue_delete(&name, opts).await }
             })
             .await;
-        if result.is_err()
-            && let Some(taken) = taken
-        {
-            self.topology.lock().unwrap().restore_queue(taken);
+        match result {
+            // Already gone, e.g. deleted elsewhere, or by this delete before a
+            // lost reply made it run again.
+            Err(Error::ChannelClosed { code: 404, .. }) => Ok(0),
+            Err(e) => {
+                if let Some(taken) = taken {
+                    self.topology.lock().unwrap().restore_queue(taken);
+                }
+                Err(e)
+            }
+            ok => ok,
         }
-        result
     }
 
     /// Remove a binding and forget it.
@@ -244,9 +284,11 @@ impl<C: Codec> Queue<C> {
         arguments: Table,
     ) -> Result<(), Error> {
         let exchange = exchange.as_ref();
+        let _guard = self.lock().await;
+        let name = self.recorded_name()?;
         self.client()?
             .with_session(|s| {
-                let (name, arguments) = (self.name(), arguments.clone());
+                let (name, arguments) = (name.clone(), arguments.clone());
                 async move {
                     s.channel()
                         .queue_unbind(&name, exchange, routing_key, arguments)

@@ -55,6 +55,11 @@ pub enum Error {
     /// not have the message; republishing may duplicate it.
     #[error("publish outcome unknown: {reason}")]
     ConfirmUncertain { reason: String },
+
+    /// The queue was deleted through its handle; the handle no longer acts on
+    /// the broker.
+    #[error("queue {name} was deleted")]
+    QueueDeleted { name: String },
 }
 
 #[derive(Debug)]

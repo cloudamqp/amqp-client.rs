@@ -1,6 +1,8 @@
 //! The exchanges, queues and bindings declared through the high-level
 //! `Client`, kept so they can be declared again after recovery (ADR-0002).
 
+use std::sync::Arc;
+
 use crate::{ExchangeDeclareOpts, QueueDeclareOpts, Table};
 
 /// Identifies a recorded queue; stable across renames of server-named queues.
@@ -21,6 +23,9 @@ pub(crate) struct RecordedQueue {
     /// The name the broker currently knows the queue by.
     pub(crate) name: String,
     pub(crate) opts: QueueDeclareOpts,
+    /// Serialises operations on this queue (bind, subscribe, delete, consumer
+    /// recovery), so none acts on a queue while it is being deleted.
+    pub(crate) lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -83,6 +88,7 @@ impl Topology {
             requested_name: requested_name.into(),
             name: name.into(),
             opts,
+            lock: Arc::default(),
         });
         id
     }

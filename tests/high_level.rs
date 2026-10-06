@@ -723,3 +723,103 @@ async fn queue_delete_while_the_consumer_is_polled() {
         );
     }
 }
+
+async fn queue_exists(name: &str) -> bool {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let passive = QueueDeclareOpts {
+        passive: true,
+        ..Default::default()
+    };
+    conn.open_channel()
+        .await
+        .unwrap()
+        .queue_declare(name, passive)
+        .await
+        .is_ok()
+}
+
+async fn delete_named(name: &str) {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    let _ = ch.queue_delete(name, QueueDeleteOpts::default()).await;
+}
+
+/// Two overlapping deletes of one queue never touch another queue (an empty
+/// queue name means "last declared on this channel" to the broker).
+#[tokio::test]
+async fn overlapping_deletes_leave_other_queues_alone() {
+    let client = recovering_json_client().await;
+    let (a, b) = (queue_name("dd-a"), queue_name("dd-b"));
+    let qa = client.queue(&a, QueueDeclareOpts::default()).await.unwrap();
+    client.queue(&b, QueueDeclareOpts::default()).await.unwrap();
+
+    let qa2 = qa.clone();
+    let (first, second) = tokio::join!(
+        qa.delete(QueueDeleteOpts::default()),
+        qa2.delete(QueueDeleteOpts::default())
+    );
+
+    let b_exists = queue_exists(&b).await;
+    delete_named(&b).await;
+    assert!(b_exists, "deleting {a} twice deleted {b}");
+    assert!(first.is_ok(), "{first:?}");
+    assert!(
+        matches!(second, Err(Error::QueueDeleted { .. })),
+        "{second:?}"
+    );
+}
+
+/// A bind overlapping a delete never binds another queue.
+#[tokio::test]
+async fn a_bind_during_a_delete_leaves_other_queues_alone() {
+    let client = recovering_json_client().await;
+    let (a, b) = (queue_name("bd-a"), queue_name("bd-b"));
+    let ex = client
+        .fanout(&queue_name("bd-ex"), ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let qa = client.queue(&a, QueueDeclareOpts::default()).await.unwrap();
+    client.queue(&b, QueueDeclareOpts::default()).await.unwrap();
+
+    let qa2 = qa.clone();
+    let (deleted, bound) = tokio::join!(qa.delete(QueueDeleteOpts::default()), qa2.bind(&ex, ""));
+    deleted.unwrap();
+    assert!(
+        matches!(bound, Err(Error::QueueDeleted { .. })),
+        "{bound:?}"
+    );
+
+    client.publish(ex.name(), "", &greeting(1)).await.unwrap();
+    let got = client.channel().basic_get(&b, true).await.unwrap();
+    delete_named(&b).await;
+    client
+        .channel()
+        .exchange_delete(ex.name(), false)
+        .await
+        .unwrap();
+    assert!(got.is_none(), "{b} was bound instead of {a}");
+}
+
+/// Deleting a queue someone else already deleted succeeds; the handle then
+/// keeps its name but refuses further operations.
+#[tokio::test]
+async fn deleting_an_already_deleted_queue_succeeds() {
+    let client = recovering_json_client().await;
+    let name = queue_name("gone-already");
+    let q = client
+        .queue(&name, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    delete_named(&name).await;
+
+    assert_eq!(q.delete(QueueDeleteOpts::default()).await.unwrap(), 0);
+    assert_eq!(q.name(), name);
+    let bound = q.bind("amq.fanout", "").await;
+    assert!(
+        matches!(bound, Err(Error::QueueDeleted { .. })),
+        "{bound:?}"
+    );
+    let subscribed = q.subscribe::<Greeting>(SubscribeOpts::default()).await;
+    assert!(matches!(subscribed, Err(Error::QueueDeleted { .. })));
+    assert!(!queue_exists(&name).await);
+}
