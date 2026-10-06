@@ -19,6 +19,7 @@ use super::config::Config;
 use crate::error::Error;
 use crate::protocol::frame::{self, Frame, PROTOCOL_HEADER};
 use crate::protocol::method::MethodFrame;
+use crate::protocol::method::channel as ch_method;
 use crate::protocol::method::connection as conn_method;
 use crate::protocol::table::Table;
 use crate::protocol::types::{LongStr, ShortStr};
@@ -42,14 +43,18 @@ pub(crate) enum OutgoingFrame {
 /// and IDs stay dense) plus a high-water counter for fresh allocations.
 pub(crate) struct ChannelIdAllocator {
     free: BTreeSet<u16>,
+    /// IDs whose `Channel.Close` was sent on drop; reusable once `CloseOk`
+    /// arrives.
+    closing: BTreeSet<u16>,
     next: u16,
     cap: u16,
 }
 
 impl ChannelIdAllocator {
-    fn new(cap: u16) -> Self {
+    pub(crate) fn new(cap: u16) -> Self {
         Self {
             free: BTreeSet::new(),
+            closing: BTreeSet::new(),
             next: 1,
             cap,
         }
@@ -74,6 +79,23 @@ impl ChannelIdAllocator {
             self.free.insert(id);
         }
     }
+
+    pub(crate) fn mark_closing(&mut self, id: u16) {
+        self.closing.insert(id);
+    }
+
+    pub(crate) fn is_closing(&self, id: u16) -> bool {
+        self.closing.contains(&id)
+    }
+
+    /// Releases `id` if it was closing. Returns whether it was.
+    pub(crate) fn finish_closing(&mut self, id: u16) -> bool {
+        let was_closing = self.closing.remove(&id);
+        if was_closing {
+            self.release(id);
+        }
+        was_closing
+    }
 }
 
 /// Internal shared state for the connection.
@@ -92,6 +114,31 @@ pub(crate) struct ConnectionShared {
     /// Capacity of `publish_admission` in bytes — used to cap
     /// `acquire_many_owned` for over-large bodies.
     pub(crate) publish_admission_capacity: usize,
+    /// Channel-ID allocator, shared with every channel and the reader task.
+    pub(crate) id_alloc: Mutex<ChannelIdAllocator>,
+}
+
+impl ConnectionShared {
+    /// Sends `Channel.Close` for `channel_id` without waiting. The reader task
+    /// frees the id when the broker's `CloseOk` arrives; if the connection is
+    /// already gone, the id is freed now.
+    pub(crate) fn close_without_waiting(&self, channel_id: u16) {
+        let close = Frame::Method(
+            channel_id,
+            MethodFrame::ChannelClose(ch_method::Close {
+                reply_code: 200,
+                reply_text: ShortStr::from_static("Normal shutdown"),
+                class_id: 0,
+                method_id: 0,
+            }),
+        );
+        let mut ids = self.id_alloc.lock().unwrap();
+        if self.frame_tx.send(OutgoingFrame::Frame(close)).is_ok() {
+            ids.mark_closing(channel_id);
+        } else {
+            ids.release(channel_id);
+        }
+    }
 }
 
 /// A stream that is either plain TCP or TLS-wrapped TCP.
@@ -155,9 +202,6 @@ pub struct Connection {
     /// Per-RPC timeout used by Channel methods, copied from `Config` at
     /// connect time so each spawned Channel can stamp its own copy.
     rpc_timeout: Duration,
-    /// Channel-ID allocator with free-list. Shared with `Channel`s so they can
-    /// release their ID on close/drop.
-    pub(crate) id_alloc: Arc<Mutex<ChannelIdAllocator>>,
     /// Handle to the reader task.
     reader_task: JoinHandle<()>,
     /// Handle to the writer task.
@@ -356,10 +400,20 @@ impl Connection {
             publish_admission_capacity.min(tokio::sync::Semaphore::MAX_PERMITS),
         ));
 
+        // Channel-ID allocator. AMQP caps at u16::MAX with 0 reserved for the
+        // connection; if the broker negotiated a smaller channel_max, honor it.
+        let id_cap = if channel_max == 0 {
+            u16::MAX
+        } else {
+            channel_max
+        };
+        let id_alloc = Mutex::new(ChannelIdAllocator::new(id_cap));
+
         let shared = Arc::new(ConnectionShared {
             frame_tx: outgoing_tx,
             publish_admission,
             publish_admission_capacity,
+            id_alloc,
         });
 
         // Channel registry shared between Connection and reader task
@@ -404,21 +458,11 @@ impl Connection {
             None
         };
 
-        // Channel-ID allocator. AMQP caps at u16::MAX with 0 reserved for the
-        // connection; if the broker negotiated a smaller channel_max, honor it.
-        let id_cap = if channel_max == 0 {
-            u16::MAX
-        } else {
-            channel_max
-        };
-        let id_alloc = Arc::new(Mutex::new(ChannelIdAllocator::new(id_cap)));
-
         Ok(Connection {
             shared,
             channel_senders,
             frame_max,
             rpc_timeout: config.rpc_timeout,
-            id_alloc,
             reader_task,
             writer_task,
             heartbeat_task,
@@ -451,10 +495,21 @@ impl Connection {
 
         // Wait for Channel.OpenOk
         let mut incoming_rx = incoming_rx;
-        let response = incoming_rx.recv().await.ok_or(Error::ConnectionClosed {
-            code: 0,
-            reason: "connection closed while opening channel".into(),
-        })?;
+        let response = match tokio::time::timeout(self.rpc_timeout, incoming_rx.recv()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                return Err(Error::ConnectionClosed {
+                    code: 0,
+                    reason: "connection closed while opening channel".into(),
+                });
+            }
+            Err(_) => {
+                self.channel_senders.lock().unwrap().remove(&channel_id);
+                // The broker may still open it; close it before reusing the id.
+                self.shared.close_without_waiting(channel_id);
+                return Err(Error::Timeout);
+            }
+        };
 
         match response {
             Frame::Method(_, MethodFrame::ChannelOpenOk) => {}
@@ -483,7 +538,6 @@ impl Connection {
             self.frame_max,
             self.rpc_timeout,
             self.channel_senders.clone(),
-            self.id_alloc.clone(),
             incoming_rx,
         ))
     }
@@ -536,7 +590,8 @@ impl Connection {
     }
 
     fn allocate_channel_id(&self) -> Result<u16, Error> {
-        self.id_alloc
+        self.shared
+            .id_alloc
             .lock()
             .unwrap()
             .allocate()
@@ -733,6 +788,51 @@ async fn writer_loop(
     }
 }
 
+/// Delivers a frame to its channel. A cached sender may be stale: its channel
+/// was dropped and the id reused by a new channel, so on a failed send the
+/// registry is consulted again.
+fn route_to_channel(
+    channel_id: u16,
+    frame: Frame,
+    cached_senders: &mut HashMap<u16, mpsc::UnboundedSender<Frame>>,
+    channel_senders: &Mutex<HashMap<u16, mpsc::UnboundedSender<Frame>>>,
+) {
+    let mut frame = frame;
+    if let Some(cached) = cached_senders.get(&channel_id) {
+        match cached.send(frame) {
+            Ok(()) => return,
+            Err(mpsc::error::SendError(f)) => frame = f,
+        }
+        let stale = cached_senders.remove(&channel_id).unwrap();
+        forget_sender(channel_senders, channel_id, &stale);
+    }
+    let Some(sender) = channel_senders.lock().unwrap().get(&channel_id).cloned() else {
+        warn!(channel_id, "frame for unknown channel");
+        return;
+    };
+    if sender.send(frame).is_err() {
+        warn!(channel_id, "channel receiver dropped");
+        forget_sender(channel_senders, channel_id, &sender);
+    } else {
+        cached_senders.insert(channel_id, sender);
+    }
+}
+
+/// Removes `sender` from the registry, unless the id now belongs to another channel.
+fn forget_sender(
+    channel_senders: &Mutex<HashMap<u16, mpsc::UnboundedSender<Frame>>>,
+    channel_id: u16,
+    sender: &mpsc::UnboundedSender<Frame>,
+) {
+    let mut senders = channel_senders.lock().unwrap();
+    if senders
+        .get(&channel_id)
+        .is_some_and(|s| s.same_channel(sender))
+    {
+        senders.remove(&channel_id);
+    }
+}
+
 /// Reader task: reads frames from the stream and routes them to the appropriate channel.
 async fn reader_loop(
     mut read_half: tokio::io::ReadHalf<MaybeTls>,
@@ -786,26 +886,29 @@ async fn reader_loop(
                         Frame::Method(0, _) => {
                             let _ = conn_tx.send(frame);
                         }
+                        Frame::Method(
+                            channel_id,
+                            MethodFrame::ChannelCloseOk | MethodFrame::ChannelClose(_),
+                        ) if shared.id_alloc.lock().unwrap().is_closing(channel_id) => {
+                            // A channel dropped while open: its Close was sent
+                            // on drop. On a simultaneous broker Close, answer it.
+                            if matches!(frame, Frame::Method(_, MethodFrame::ChannelClose(_))) {
+                                let close_ok =
+                                    Frame::Method(channel_id, MethodFrame::ChannelCloseOk);
+                                let _ = shared.frame_tx.send(OutgoingFrame::Frame(close_ok));
+                            }
+                            cached_senders.remove(&channel_id);
+                            shared.id_alloc.lock().unwrap().finish_closing(channel_id);
+                        }
                         Frame::Method(channel_id, _)
                         | Frame::Header(channel_id, _)
                         | Frame::Body(channel_id, _) => {
-                            // Try cached sender first, fall back to locked lookup
-                            let sender = cached_senders.get(&channel_id).cloned().or_else(|| {
-                                let s = channel_senders.lock().unwrap().get(&channel_id).cloned();
-                                if let Some(ref s) = s {
-                                    cached_senders.insert(channel_id, s.clone());
-                                }
-                                s
-                            });
-                            if let Some(sender) = sender {
-                                if sender.send(frame).is_err() {
-                                    warn!(channel_id, "channel receiver dropped");
-                                    cached_senders.remove(&channel_id);
-                                    channel_senders.lock().unwrap().remove(&channel_id);
-                                }
-                            } else {
-                                warn!(channel_id, "frame for unknown channel");
-                            }
+                            route_to_channel(
+                                channel_id,
+                                frame,
+                                &mut cached_senders,
+                                &channel_senders,
+                            );
                         }
                     }
                 }
@@ -1016,6 +1119,24 @@ mod tests {
         assert_eq!(a.allocate(), Some(1));
         assert_eq!(a.allocate(), Some(3));
         assert_eq!(a.allocate(), Some(6));
+    }
+
+    #[test]
+    fn allocator_holds_closing_ids_until_close_ok() {
+        let mut a = ChannelIdAllocator::new(u16::MAX);
+        assert_eq!(a.allocate(), Some(1));
+        a.mark_closing(1);
+        assert_eq!(a.allocate(), Some(2));
+        assert!(a.finish_closing(1));
+        assert_eq!(a.allocate(), Some(1));
+    }
+
+    #[test]
+    fn allocator_finish_closing_ignores_ids_not_closing() {
+        let mut a = ChannelIdAllocator::new(u16::MAX);
+        assert_eq!(a.allocate(), Some(1));
+        assert!(!a.finish_closing(1));
+        assert_eq!(a.allocate(), Some(2));
     }
 
     /// Encode an oversized fake frame header and verify the decoder rejects it.

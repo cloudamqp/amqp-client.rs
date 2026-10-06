@@ -421,3 +421,47 @@ async fn basic_recover() {
     ch.close().await.unwrap();
     conn.close().await.unwrap();
 }
+
+/// Dropping an open channel frees its id; a channel opened afterwards (which
+/// may reuse that id) must work.
+#[tokio::test]
+async fn reopen_after_dropping_an_open_channel() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    drop(ch);
+    let ch = tokio::time::timeout(Duration::from_secs(5), conn.open_channel())
+        .await
+        .expect("open_channel hung")
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ch.queue_declare("", QueueDeclareOpts::default()),
+    )
+    .await
+    .expect("queue_declare hung")
+    .unwrap();
+}
+
+/// A channel the broker closed frees its id; a channel opened afterwards on
+/// that id must work.
+#[tokio::test]
+async fn reopen_after_broker_closed_a_channel() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let name = format!("amqp-client-rs-test-reopen-{}", std::process::id());
+    let ch = conn.open_channel().await.unwrap();
+    ch.exchange_declare(&name, "direct", ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    assert!(
+        ch.exchange_declare(&name, "fanout", ExchangeDeclareOpts::default())
+            .await
+            .is_err()
+    );
+    drop(ch);
+    let ch = tokio::time::timeout(Duration::from_secs(5), conn.open_channel())
+        .await
+        .expect("open_channel hung")
+        .unwrap();
+    ch.exchange_delete(&name, false).await.unwrap();
+}

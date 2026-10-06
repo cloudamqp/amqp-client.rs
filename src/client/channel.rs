@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::{Bytes, BytesMut};
@@ -59,7 +60,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
-use super::connection::{ChannelIdAllocator, ConnectionShared, OutgoingFrame};
+use super::connection::{ConnectionShared, OutgoingFrame};
 use super::consumer::Consumer;
 use super::exchange::Exchange;
 use super::message::{DeliverMessage, GetMessage, MessageHandle};
@@ -267,9 +268,9 @@ pub struct Channel {
     rpc_timeout: std::time::Duration,
     /// Channel registry (shared with connection) for cleanup on close.
     channel_senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Frame>>>>,
-    /// Channel-ID allocator (shared with connection) for releasing the ID on
-    /// close/drop so it can be reused.
-    id_alloc: Arc<Mutex<ChannelIdAllocator>>,
+    /// Set once the channel is closed on the broker (by `close()` or by the
+    /// broker), so drop need not send `Channel.Close`.
+    closed: Arc<AtomicBool>,
     /// Per-channel RPC serialization lock. Each public RPC method takes
     /// this as an `OwnedMutexGuard` and hands ownership to the dispatch
     /// task via the `inflight_rpc` slot, so the next caller can't proceed
@@ -302,7 +303,6 @@ impl Channel {
         frame_max: u32,
         rpc_timeout: std::time::Duration,
         channel_senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Frame>>>>,
-        id_alloc: Arc<Mutex<ChannelIdAllocator>>,
         incoming_rx: mpsc::UnboundedReceiver<Frame>,
     ) -> Self {
         let consumer_senders: Arc<Mutex<HashMap<ShortStr, ConsumerEntry>>> =
@@ -314,6 +314,7 @@ impl Channel {
         let confirms_state = Arc::new(Mutex::new(ConfirmsState::default()));
         let rpc_lock = Arc::new(tokio::sync::Mutex::new(()));
         let inflight_rpc: Arc<Mutex<Option<RpcExpectation>>> = Arc::new(Mutex::new(None));
+        let closed = Arc::new(AtomicBool::new(false));
 
         // Spawn the dispatch task
         let dispatch_shared = shared.clone();
@@ -329,6 +330,7 @@ impl Channel {
             flow_tx,
             dispatch_returns,
             dispatch_confirms,
+            closed.clone(),
             incoming_rx,
         ));
 
@@ -338,7 +340,7 @@ impl Channel {
             frame_max,
             rpc_timeout,
             channel_senders,
-            id_alloc,
+            closed,
             rpc_lock,
             inflight_rpc,
             consumer_senders,
@@ -944,8 +946,8 @@ impl Channel {
         let response = self.expect_plain(method, "Channel.CloseOk").await?;
         match response {
             MethodFrame::ChannelCloseOk => {
-                // Drop will release the registry entry and the ID, but we
-                // still want to log explicitly here.
+                // Drop releases the registry entry and the ID.
+                self.closed.store(true, Ordering::Release);
                 debug!(channel_id = self.id, "channel closed");
                 Ok(())
             }
@@ -1161,8 +1163,13 @@ impl Drop for Channel {
         // task stops trying to route frames here, and return the ID to the
         // free-list so it can be reused.
         self.channel_senders.lock().unwrap().remove(&self.id);
-        self.id_alloc.lock().unwrap().release(self.id);
         self._dispatch_task.abort();
+        if self.closed.load(Ordering::Acquire) {
+            self.shared.id_alloc.lock().unwrap().release(self.id);
+        } else {
+            // Still open on the broker: close it there before reusing the ID.
+            self.shared.close_without_waiting(self.id);
+        }
     }
 }
 
@@ -1179,6 +1186,7 @@ async fn dispatch_loop(
     flow_tx: tokio::sync::watch::Sender<bool>,
     returns_state: Arc<Mutex<ReturnsState>>,
     confirms_state: Arc<Mutex<ConfirmsState>>,
+    closed: Arc<AtomicBool>,
     mut rx: mpsc::UnboundedReceiver<Frame>,
 ) {
     let mut cached_consumers: HashMap<ShortStr, ConsumerEntry> = HashMap::new();
@@ -1287,6 +1295,7 @@ async fn dispatch_loop(
                     reason = %close.reply_text,
                     "server closing channel"
                 );
+                closed.store(true, Ordering::Release);
                 let close_ok = Frame::Method(channel_id, MethodFrame::ChannelCloseOk);
                 let _ = shared.frame_tx.send(OutgoingFrame::Frame(close_ok));
                 set_cancellation_for_all(

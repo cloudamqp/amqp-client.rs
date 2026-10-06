@@ -141,6 +141,8 @@ impl std::fmt::Debug for GetMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::connection::ChannelIdAllocator;
+    use std::sync::Mutex;
     use tokio::sync::{Semaphore, mpsc};
 
     fn handle() -> (MessageHandle, mpsc::UnboundedReceiver<OutgoingFrame>) {
@@ -149,6 +151,7 @@ mod tests {
             frame_tx,
             publish_admission: Arc::new(Semaphore::new(1)),
             publish_admission_capacity: 1,
+            id_alloc: Mutex::new(ChannelIdAllocator::new(1)),
         });
         (MessageHandle::new(7, shared), rx)
     }
