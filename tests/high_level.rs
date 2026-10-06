@@ -438,3 +438,117 @@ async fn consumer_ends_after_channel_closed_without_recovery() {
     let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
     assert!(matches!(ended, Ok(None)), "consumer did not end");
 }
+
+/// Publishes to `exchange` until the consumer receives a message; recovery
+/// re-binds asynchronously, so early publishes may be dropped unrouted.
+async fn publish_until_received(
+    client: &Client<JsonCodec>,
+    exchange: &str,
+    routing_key: &str,
+    consumer: &mut TypedConsumer<Greeting, JsonCodec>,
+) -> Greeting {
+    for _ in 0..50 {
+        client
+            .publish(exchange, routing_key, &greeting(7))
+            .await
+            .unwrap();
+        if let Some(d) = next_within(consumer, Duration::from_millis(100)).await {
+            d.ack().unwrap();
+            return d.body;
+        }
+    }
+    panic!("consumer did not recover");
+}
+
+async fn delete_elsewhere(queue: &str) {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    ch.queue_delete(queue, QueueDeleteOpts::default())
+        .await
+        .unwrap();
+}
+
+/// With recovery, a consumer whose queue was deleted by someone else declares
+/// the queue and its bindings again and consumes again.
+#[tokio::test]
+async fn consumer_recovers_after_queue_deleted_elsewhere() {
+    let client = recovering_json_client().await;
+    let ex = client
+        .topic(&queue_name("cancel-ex"), ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let name = queue_name("cancel");
+    let q = client
+        .queue(&name, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    q.bind(&ex, "k").await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    delete_elsewhere(&name).await;
+
+    let body = publish_until_received(&client, ex.name(), "k", &mut consumer).await;
+    assert_eq!(body, greeting(7));
+    assert_eq!(q.name(), name);
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+    client
+        .channel()
+        .exchange_delete(ex.name(), false)
+        .await
+        .unwrap();
+}
+
+/// A deleted server-named queue comes back under a new name, with its
+/// bindings following it.
+#[tokio::test]
+async fn deleted_server_named_queue_comes_back_renamed() {
+    let client = recovering_json_client().await;
+    let ex = client
+        .topic(&queue_name("rename-ex"), ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    let auto_delete = QueueDeclareOpts {
+        auto_delete: true,
+        ..Default::default()
+    };
+    let q = client.queue("", auto_delete).await.unwrap();
+    q.bind(&ex, "k").await.unwrap();
+    let old_name = q.name();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    delete_elsewhere(&old_name).await;
+
+    publish_until_received(&client, ex.name(), "k", &mut consumer).await;
+    assert_ne!(q.name(), old_name);
+    client
+        .channel()
+        .exchange_delete(ex.name(), false)
+        .await
+        .unwrap();
+}
+
+/// Deleting the queue through its handle ends its consumers, also with
+/// recovery on.
+#[tokio::test]
+async fn queue_delete_ends_its_consumers_with_recovery() {
+    let client = recovering_json_client().await;
+    let q = client
+        .queue(&queue_name("delete-recovery"), QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+}
