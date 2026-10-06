@@ -45,7 +45,8 @@ pub use client::consumer::{CancellationReason, Consumer};
 pub use client::message::{DeliverMessage, GetMessage};
 pub use error::{Error, ProtocolError};
 pub use high_level::{
-    ByteCodec, Client, ClientBuilder, Codec, Exchange, ExchangeKind, TypedConsumer, TypedDelivery,
+    ByteCodec, Client, ClientBuilder, Codec, Exchange, ExchangeKind, Queue, TypedConsumer,
+    TypedDelivery,
 };
 pub use protocol::properties::BasicProperties;
 pub use protocol::table::{FieldValue, Table};

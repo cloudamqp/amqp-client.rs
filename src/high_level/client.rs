@@ -7,8 +7,9 @@ use tracing::{debug, info};
 use super::codec::{ByteCodec, Codec};
 use super::consumer::TypedConsumer;
 use super::exchange::{Exchange, ExchangeKind};
+use super::queue::Queue;
 use super::topology::Topology;
-use crate::client::channel::{Channel, ConsumeOpts, ExchangeDeclareOpts};
+use crate::client::channel::{Channel, ConsumeOpts, ExchangeDeclareOpts, QueueDeclareOpts};
 use crate::client::config::Config;
 use crate::client::connection::Connection;
 use crate::error::Error;
@@ -105,6 +106,18 @@ impl<C: Codec> Client<C> {
     /// Declare a headers exchange. See [`Client::exchange`].
     pub async fn headers(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
         self.exchange(name, ExchangeKind::Headers, opts).await
+    }
+
+    /// Declare a queue and record it, so it is declared again after recovery.
+    /// An empty `name` lets the broker name the queue.
+    pub async fn queue(&self, name: &str, opts: QueueDeclareOpts) -> Result<Queue, Error> {
+        let ok = self.channel.queue_declare(name, opts.clone()).await?;
+        let id = self
+            .topology
+            .lock()
+            .unwrap()
+            .record_queue(name, &ok.queue, opts);
+        Ok(Queue::new(id, self.topology.clone()))
     }
 
     /// Publish a serialized message to an exchange with the given routing key.

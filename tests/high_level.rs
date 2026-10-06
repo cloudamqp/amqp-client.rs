@@ -285,3 +285,47 @@ async fn client_declares_exchanges_of_each_kind() {
         ch.exchange_delete(exchange.name(), false).await.unwrap();
     }
 }
+
+/// A named queue keeps its name; it exists on the broker.
+#[tokio::test]
+async fn client_declares_a_named_queue() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let name = queue_name("named");
+    let q = client
+        .queue(&name, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(q.name(), name);
+
+    let passive = QueueDeclareOpts {
+        passive: true,
+        ..Default::default()
+    };
+    let ch = client.channel();
+    ch.queue_declare(&name, passive).await.unwrap();
+    ch.queue_delete(&name, QueueDeleteOpts::default())
+        .await
+        .unwrap();
+}
+
+/// A server-named queue takes the name the broker assigned.
+#[tokio::test]
+async fn client_declares_a_server_named_queue() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let exclusive = QueueDeclareOpts {
+        exclusive: true,
+        ..Default::default()
+    };
+    let q = client.queue("", exclusive).await.unwrap();
+    assert!(!q.name().is_empty());
+
+    let passive = QueueDeclareOpts {
+        passive: true,
+        ..Default::default()
+    };
+    client
+        .channel()
+        .queue_declare(&q.name(), passive)
+        .await
+        .unwrap();
+}
