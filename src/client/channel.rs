@@ -963,7 +963,7 @@ impl Channel {
         match response {
             MethodFrame::ChannelCloseOk => {
                 // Drop releases the registry entry and the ID.
-                let _ = self.closed.set((200, "closed by client".into()));
+                let _ = self.closed.set(ChannelClose::new(200, "closed by client"));
                 debug!(channel_id = self.id, "channel closed");
                 Ok(())
             }
@@ -987,6 +987,12 @@ impl Channel {
     /// `ChannelClosed` with the broker's reply, once the channel is closed.
     pub(crate) fn closed_error(&self) -> Option<Error> {
         self.check_open().err()
+    }
+
+    /// Confirms that were pending when the broker closed this channel; `None`
+    /// while it is open.
+    pub(crate) fn pending_confirms_at_close(&self) -> Option<usize> {
+        self.closed.get().map(|close| close.pending_confirms)
     }
 
     /// Whether the channel is closed on the broker.
@@ -1194,7 +1200,7 @@ impl Drop for Channel {
         let was_closed = self.closed.get().is_some();
         // Late acks from this channel's deliveries must fail rather than land
         // on a channel that reuses the id.
-        let _ = self.closed.set((0, "channel dropped".into()));
+        let _ = self.closed.set(ChannelClose::new(0, "channel dropped"));
         if was_closed {
             self.shared.id_alloc.lock().unwrap().release(self.id);
         } else {
@@ -1211,16 +1217,34 @@ fn connection_closed() -> Error {
     }
 }
 
-/// The broker's reply code and text once a channel is closed.
-pub(crate) type ClosedState = Arc<OnceLock<(u16, String)>>;
+/// Why a channel is closed.
+pub(crate) struct ChannelClose {
+    pub(crate) code: u16,
+    pub(crate) reason: String,
+    /// Publisher confirms still pending when the broker closed the channel.
+    pub(crate) pending_confirms: usize,
+}
+
+impl ChannelClose {
+    pub(crate) fn new(code: u16, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+            pending_confirms: 0,
+        }
+    }
+}
+
+/// Set once a channel is closed.
+pub(crate) type ClosedState = Arc<OnceLock<ChannelClose>>;
 
 /// `Err(ChannelClosed)` once `closed` is set.
 pub(crate) fn check_open(channel_id: u16, closed: &ClosedState) -> Result<(), Error> {
     match closed.get() {
-        Some((code, reason)) => Err(Error::ChannelClosed {
+        Some(close) => Err(Error::ChannelClosed {
             channel_id,
-            code: *code,
-            reason: reason.clone(),
+            code: close.code,
+            reason: close.reason.clone(),
         }),
         None => Ok(()),
     }
@@ -1343,7 +1367,11 @@ async fn dispatch_loop(
                     reason = %close.reply_text,
                     "server closing channel"
                 );
-                let _ = closed.set((close.reply_code, close.reply_text.to_string()));
+                let pending_confirms = confirms_state.lock().unwrap().pending.len();
+                let _ = closed.set(ChannelClose {
+                    pending_confirms,
+                    ..ChannelClose::new(close.reply_code, close.reply_text.to_string())
+                });
                 let close_ok = Frame::Method(channel_id, MethodFrame::ChannelCloseOk);
                 let _ = shared.frame_tx.send(OutgoingFrame::Frame(close_ok));
                 set_cancellation_for_all(

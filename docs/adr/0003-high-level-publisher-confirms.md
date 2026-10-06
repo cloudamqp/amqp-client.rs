@@ -17,8 +17,12 @@ A confirmed publish ends in one of four ways:
 |---|---|---|
 | `Ok(())` | Acked | Yes |
 | `Err(PublishNacked)` | Nacked, e.g. full queue with `reject-publish` | No |
-| `Err(ChannelClosed)` | The broker closed the confirm channel, e.g. 404 for a missing exchange | No |
-| `Err(ConfirmUncertain)` | Sent, but the connection was lost or `rpc_timeout` passed before the confirm | Unknown |
+| `Err(ChannelClosed)` | The broker closed the confirm channel while this was the only confirm pending, so this publish caused it, e.g. 404 for a missing exchange | No |
+| `Err(ConfirmUncertain)` | Sent, but no confirm arrived: the connection was lost, `rpc_timeout` passed, or the broker closed the confirm channel while other confirms were pending too | Unknown |
+
+Which publish made the broker close the channel cannot be known (the close
+does not name a delivery tag), so a close with several confirms pending makes
+all of them uncertain, even if some were in fact discarded.
 
 With recovery on (ADR-0002), a confirmed publish that could not be sent
 because the connection was already gone waits for the recovered session
@@ -46,6 +50,6 @@ complete messages. A publish that was sent is never sent again by the client.
 - Callers must handle `ConfirmUncertain`, e.g. by republishing with
   idempotent consumers, or by recording the message for later.
 - One bad confirmed publish (e.g. to a missing exchange) closes the shared
-  confirm channel; other confirmed publishes in flight on it fail with the
-  same `ChannelClosed`.
+  confirm channel; the other confirmed publishes in flight on it become
+  `ConfirmUncertain`, and so does the bad one if it was not alone.
 - Mandatory publishes and returns are not part of the high-level API.

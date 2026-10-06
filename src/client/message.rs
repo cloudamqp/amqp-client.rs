@@ -144,6 +144,7 @@ impl std::fmt::Debug for GetMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::channel::ChannelClose;
     use crate::client::connection::ChannelIdAllocator;
     use std::sync::Mutex;
     use tokio::sync::{Semaphore, mpsc};
@@ -213,7 +214,7 @@ mod tests {
     #[test]
     fn ack_on_a_closed_channel_errors() {
         let (h, mut rx) = handle();
-        let _ = h.closed.set((406, "PRECONDITION_FAILED".into()));
+        let _ = h.closed.set(ChannelClose::new(406, "PRECONDITION_FAILED"));
         assert!(matches!(
             h.ack(1),
             Err(Error::ChannelClosed { code: 406, .. })

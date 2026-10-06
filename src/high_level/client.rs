@@ -160,11 +160,13 @@ impl<C: Codec> Client<C> {
     /// Publish a serialized message and wait until the broker confirms it.
     ///
     /// Returns `Ok` once acked, [`Error::PublishNacked`] if the broker
-    /// rejected it, and `ChannelClosed` if the broker closed the channel
-    /// instead (e.g. 404 for a missing exchange): in those cases the broker
-    /// does not have the message. [`Error::ConfirmUncertain`] means it was
-    /// sent but no confirm arrived (connection lost, or `rpc_timeout`
-    /// passed): the broker may or may not have it. With recovery on, a
+    /// rejected it, and `ChannelClosed` if the broker closed the confirm
+    /// channel because of this publish (e.g. 404 for a missing exchange): in
+    /// those cases the broker does not have the message.
+    /// [`Error::ConfirmUncertain`] means it was sent but no confirm arrived
+    /// (connection lost, `rpc_timeout` passed, or the broker closed the
+    /// confirm channel with other publishes in flight): the broker may or may
+    /// not have it. With recovery on, a
     /// publish that could not be sent because the connection was already
     /// gone is sent once more on the recovered connection. Confirms are
     /// requested on a channel of their own.
@@ -207,17 +209,13 @@ impl<C: Codec> Client<C> {
                 }
             })
             .await?;
-        match tokio::time::timeout(self.inner.rpc_timeout(), confirm).await {
-            Ok(Ok(Confirmation::Acked)) => Ok(()),
-            Ok(Ok(Confirmation::Nacked { .. })) => Err(Error::PublishNacked),
-            // The broker closed the channel: it discarded the message.
-            Ok(Err(e)) => Err(channel.closed_error().unwrap_or(Error::ConfirmUncertain {
-                reason: format!("connection lost before the confirm arrived: {e}"),
-            })),
-            Err(_) => Err(Error::ConfirmUncertain {
-                reason: "no confirm within rpc_timeout".into(),
-            }),
-        }
+        let confirm = tokio::time::timeout(self.inner.rpc_timeout(), confirm)
+            .await
+            .ok();
+        let closed_by_broker = channel
+            .closed_error()
+            .zip(channel.pending_confirms_at_close());
+        confirm_outcome(confirm, closed_by_broker)
     }
 
     async fn publish_inner<T: serde::Serialize + 'static>(
@@ -238,6 +236,37 @@ impl<C: Codec> Client<C> {
                 }
             })
             .await
+    }
+}
+
+/// The outcome of a confirmed publish, from its confirm (`None` if none came
+/// within `rpc_timeout`) and, if the broker closed the confirm channel, that
+/// close with the number of confirms then pending (ADR-0003).
+fn confirm_outcome(
+    confirm: Option<Result<Confirmation, Error>>,
+    closed_by_broker: Option<(Error, usize)>,
+) -> Result<(), Error> {
+    match confirm {
+        Some(Ok(Confirmation::Acked)) => Ok(()),
+        Some(Ok(Confirmation::Nacked { .. })) => Err(Error::PublishNacked),
+        Some(Err(e)) => match closed_by_broker {
+            // The confirm channel carries only confirmed publishes: if this
+            // one alone was pending, it caused the close and was discarded.
+            Some((closed, 1)) => Err(closed),
+            // Another publish caused it; this one may have been routed.
+            Some((closed, _)) => Err(Error::ConfirmUncertain {
+                reason: format!(
+                    "the broker closed the confirm channel with other publishes in flight: \
+                     {closed}"
+                ),
+            }),
+            None => Err(Error::ConfirmUncertain {
+                reason: format!("connection lost before the confirm arrived: {e}"),
+            }),
+        },
+        None => Err(Error::ConfirmUncertain {
+            reason: "no confirm within rpc_timeout".into(),
+        }),
     }
 }
 
@@ -284,5 +313,63 @@ impl<C: Codec> ClientBuilder<C> {
             codec: self.codec,
             inner,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closed(code: u16) -> Error {
+        Error::ChannelClosed {
+            channel_id: 2,
+            code,
+            reason: "NOT_FOUND".into(),
+        }
+    }
+
+    fn lost() -> Error {
+        Error::ConnectionClosed {
+            code: 0,
+            reason: "channel closed before confirm arrived".into(),
+        }
+    }
+
+    #[test]
+    fn an_ack_is_ok() {
+        assert!(confirm_outcome(Some(Ok(Confirmation::Acked)), None).is_ok());
+    }
+
+    #[test]
+    fn a_nack_is_publish_nacked() {
+        let nacked = confirm_outcome(Some(Ok(Confirmation::Nacked { requeue: false })), None);
+        assert!(matches!(nacked, Err(Error::PublishNacked)));
+    }
+
+    #[test]
+    fn a_close_with_only_this_confirm_pending_is_certain() {
+        let outcome = confirm_outcome(Some(Err(lost())), Some((closed(404), 1)));
+        assert!(matches!(
+            outcome,
+            Err(Error::ChannelClosed { code: 404, .. })
+        ));
+    }
+
+    #[test]
+    fn a_close_with_other_confirms_pending_is_uncertain() {
+        let outcome = confirm_outcome(Some(Err(lost())), Some((closed(404), 3)));
+        assert!(matches!(outcome, Err(Error::ConfirmUncertain { .. })));
+    }
+
+    #[test]
+    fn a_lost_connection_is_uncertain() {
+        let outcome = confirm_outcome(Some(Err(lost())), None);
+        assert!(matches!(outcome, Err(Error::ConfirmUncertain { .. })));
+    }
+
+    #[test]
+    fn no_confirm_in_time_is_uncertain() {
+        let outcome = confirm_outcome(None, None);
+        assert!(matches!(outcome, Err(Error::ConfirmUncertain { .. })));
     }
 }
