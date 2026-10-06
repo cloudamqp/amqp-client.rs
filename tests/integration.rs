@@ -651,3 +651,52 @@ async fn publish_fails_once_the_connection_is_gone() {
         "publish after connection loss: {published:?}"
     );
 }
+
+/// Acking a delivery after its channel was dropped fails, instead of landing
+/// on a new channel that reused the id (which the broker would close with
+/// "unknown delivery tag").
+#[tokio::test]
+async fn ack_after_the_channel_is_dropped_fails() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch0 = conn.open_channel().await.unwrap();
+    let queue = ch0
+        .queue_declare(
+            "",
+            QueueDeclareOpts {
+                exclusive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .queue;
+    ch0.basic_publish("", &queue, b"x".to_vec(), BasicProperties::default())
+        .await
+        .unwrap();
+    let ch1 = conn.open_channel().await.unwrap();
+    let mut consumer = ch1
+        .basic_consume(&queue, "", ConsumeOpts::default())
+        .await
+        .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(2), consumer.next())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(consumer);
+    let dropped_id = ch1.id();
+    drop(ch1);
+    tokio::time::sleep(Duration::from_millis(200)).await; // CloseOk frees the id
+    let ch2 = conn.open_channel().await.unwrap();
+    assert_eq!(ch2.id(), dropped_id, "test needs the id to be reused");
+
+    assert!(matches!(
+        msg.ack(),
+        Err(amqp_client_rs::Error::ChannelClosed { .. })
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let passive = QueueDeclareOpts {
+        passive: true,
+        ..Default::default()
+    };
+    ch2.queue_declare(&queue, passive).await.unwrap();
+}

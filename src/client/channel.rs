@@ -1184,7 +1184,11 @@ impl Drop for Channel {
         // free-list so it can be reused.
         self.channel_senders.lock().unwrap().remove(&self.id);
         self._dispatch_task.abort();
-        if self.closed.get().is_some() {
+        let was_closed = self.closed.get().is_some();
+        // Late acks from this channel's deliveries must fail rather than land
+        // on a channel that reuses the id.
+        let _ = self.closed.set((0, "channel dropped".into()));
+        if was_closed {
             self.shared.id_alloc.lock().unwrap().release(self.id);
         } else {
             // Still open on the broker: close it there before reusing the ID.
