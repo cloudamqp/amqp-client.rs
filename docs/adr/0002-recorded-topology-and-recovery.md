@@ -64,6 +64,8 @@ q.delete(QueueDeleteOpts::default()).await?;
 - Declaring, binding and consuming record; `unbind` and `delete` forget.
   Deleting a recorded queue also forgets its bindings and ends its consumers
   (`next()` returns `None`), so a deliberate delete is not undone by recovery.
+  It is forgotten before the delete is sent (and restored if the delete
+  fails), because the broker cancels the queue's consumers before it replies.
 - Each recoverable consumer has its own channel and its own prefetch
   (`basic_qos`), so one consumer's `ChannelClosed` does not affect the others
   and QoS needs no setup hook.
@@ -89,7 +91,7 @@ q.delete(QueueDeleteOpts::default()).await?;
   is alive) runs inside the consumer's `next()`: open a channel, declare the
   queue, the recorded exchanges its bindings use (one may be gone too, e.g.
   auto-deleted), and its bindings, set prefetch, consume. On failure it waits
-  `RecoveryConfig::timeout` and retries. If it observes session loss, it becomes
+  `RecoveryConfig::timeout` (at least 100 ms, as for every retry) and retries. If it observes session loss, it becomes
   a recovery waiter on the session recovery above.
 - **Declaration failures during recovery** (e.g. `PRECONDITION_FAILED`) fail
   that attempt, are logged at `warn`, and are retried after
@@ -129,9 +131,12 @@ q.delete(QueueDeleteOpts::default()).await?;
 - **A queue deleted by someone else is recreated** while a recoverable consumer
   on it lives. Only deleting through the `Queue` handle, or dropping the
   consumer, stops that.
-- **Bounded waits for transient operations.** `publish` and new `consume()`
-  calls wait up to `RecoveryConfig::timeout` for a usable session, then return
-  `Error::ConnectionClosed { code: 0, .. }`. Publishes are not buffered.
+- **Bounded waits for transient operations.** `publish`, declarations and new
+  `subscribe()` calls wait up to `RecoveryConfig::timeout` in total for a usable
+  session (time spent in the operation itself not counted), then return
+  `Error::ConnectionClosed { code: 0, .. }`. An operation cut off by session
+  loss is run once more on the recovered session, except a confirmed publish
+  that was already sent (ADR-0003); publishes are not buffered.
 - **Unbounded wait for recoverable consumers.** `next()` waits across recovery
   and resumes; dropping the consumer, deleting its queue through the handle, or
   dropping the `Client` ends it.
