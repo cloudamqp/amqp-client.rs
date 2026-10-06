@@ -1,0 +1,31 @@
+[package]
+name = "amqp-client-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Magnus Landerblom <mange@84codes.com>"]
+description = "An AMQP 0-9-1 client library built on tokio."
+license = "MIT"
+readme = "README.md"
+keywords = ["amqp", "rabbitmq", "lavinmq", "tokio", "async"]
+categories = ["network-programming", "asynchronous"]
+homepage = "https://github.com/cloudamqp/amqp-client.rs"
+repository = "https://github.com/cloudamqp/amqp-client.rs"
+documentation = "https://docs.rs/amqp-client-rs"
+
+[dependencies]
+bytes = "1"
+bitflags = "2"
+tokio = { version = "1", features = ["net", "rt", "macros", "sync", "time", "io-util"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
+thiserror = "2"
+tracing = "0.1"
+url = "2"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
+serde_json = "1"

@@ -1,0 +1,423 @@
+use std::time::Duration;
+
+use amqp_client_rs::{
+    BasicProperties, Channel, Connection, ConsumeOpts, ExchangeDeclareOpts, QueueDeclareOpts,
+    QueueDeleteOpts, Table,
+};
+
+const AMQP_URI: &str = "amqp://guest:guest@127.0.0.1";
+
+/// Helper: connect and open a channel, declare a unique queue, return all three.
+async fn setup(test_name: &str) -> (Connection, Channel, String) {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    let queue_name = format!("amqp-client-rs-test-{}-{}", test_name, std::process::id());
+    let ok = ch
+        .queue_declare(&queue_name, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(ok.queue, queue_name);
+    (conn, ch, queue_name)
+}
+
+/// Helper: delete queue, close channel and connection.
+async fn teardown(ch: Channel, conn: Connection, queue_name: &str) {
+    let _ = ch
+        .queue_delete(queue_name, QueueDeleteOpts::default())
+        .await;
+    let _ = ch.close().await;
+    let _ = conn.close().await;
+}
+
+// -----------------------------------------------------------------------
+// Connection tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn connect_and_close() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn connect_bad_host() {
+    let result = Connection::connect("amqp://guest:guest@127.0.0.1:19999").await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn connect_with_config() {
+    let config = amqp_client_rs::Config::from_uri(AMQP_URI).unwrap();
+    let conn = Connection::connect_with_config(config).await.unwrap();
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_multiple_channels() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch1 = conn.open_channel().await.unwrap();
+    let ch2 = conn.open_channel().await.unwrap();
+    let ch3 = conn.open_channel().await.unwrap();
+    assert_eq!(ch1.id(), 1);
+    assert_eq!(ch2.id(), 2);
+    assert_eq!(ch3.id(), 3);
+    ch1.close().await.unwrap();
+    ch2.close().await.unwrap();
+    ch3.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Publish + Get tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_and_basic_get() {
+    let (conn, ch, queue) = setup("pub-get").await;
+
+    ch.basic_publish("", &queue, b"hello world", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let msg = ch.basic_get(&queue, false).await.unwrap().unwrap();
+    assert_eq!(msg.body.as_ref(), b"hello world");
+    assert_eq!(msg.exchange.as_bytes(), b"");
+    assert_eq!(msg.routing_key.as_bytes(), queue.as_bytes());
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+#[tokio::test]
+async fn publish_large_body() {
+    let (conn, ch, queue) = setup("pub-large").await;
+
+    let body = vec![0xAB_u8; 256 * 1024]; // 256KB
+    ch.basic_publish("", &queue, body.as_slice(), BasicProperties::default())
+        .await
+        .unwrap();
+
+    let msg = ch.basic_get(&queue, false).await.unwrap().unwrap();
+    assert_eq!(msg.body.len(), 256 * 1024);
+    assert!(msg.body.iter().all(|&b| b == 0xAB));
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+#[tokio::test]
+async fn publish_empty_body() {
+    let (conn, ch, queue) = setup("pub-empty").await;
+
+    ch.basic_publish("", &queue, b"", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let msg = ch.basic_get(&queue, false).await.unwrap().unwrap();
+    assert!(msg.body.is_empty());
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+#[tokio::test]
+async fn publish_with_headers() {
+    let (conn, ch, queue) = setup("pub-headers").await;
+
+    let mut headers = Table::new();
+    headers.insert(
+        amqp_client_rs::ShortStr::try_from("x-custom").unwrap(),
+        amqp_client_rs::FieldValue::LongStr(amqp_client_rs::LongStr::from("value1")),
+    );
+    let props = BasicProperties::builder()
+        .content_type("application/json")
+        .headers(headers)
+        .build()
+        .unwrap();
+
+    ch.basic_publish("", &queue, b"{}", props).await.unwrap();
+
+    let msg = ch.basic_get(&queue, false).await.unwrap().unwrap();
+    assert_eq!(msg.body.as_ref(), b"{}");
+    assert!(msg.properties.content_type.is_some());
+    assert!(msg.properties.headers.is_some());
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+// -----------------------------------------------------------------------
+// Consumer tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn basic_consume_and_ack() {
+    let (conn, ch, queue) = setup("consume-ack").await;
+
+    ch.basic_publish("", &queue, b"consume me", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let mut consumer = ch
+        .basic_consume(&queue, "test-consumer", ConsumeOpts::default())
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(msg.body.as_ref(), b"consume me");
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+#[tokio::test]
+async fn basic_consume_nack_requeue() {
+    let (conn, ch, queue) = setup("consume-nack").await;
+
+    ch.basic_publish("", &queue, b"nack me", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let mut consumer = ch
+        .basic_consume(&queue, "test-nack", ConsumeOpts::default())
+        .await
+        .unwrap();
+
+    // Get the message and nack with requeue
+    let msg = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.body.as_ref(), b"nack me");
+    msg.nack(true).unwrap();
+
+    // Message should be redelivered
+    let msg2 = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg2.body.as_ref(), b"nack me");
+    assert!(msg2.redelivered);
+    msg2.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+// -----------------------------------------------------------------------
+// Queue tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn queue_declare_and_delete() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    let qname = format!("amqp-client-rs-test-decl-del-{}", std::process::id());
+    let ok = ch
+        .queue_declare(&qname, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(ok.queue, qname);
+    assert_eq!(ok.message_count, 0);
+
+    let purged = ch
+        .queue_delete(&qname, QueueDeleteOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(purged, 0);
+
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_declare_server_named() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    // Empty name = server-generated name
+    let ok = ch
+        .queue_declare("", QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    assert!(!ok.queue.is_empty());
+
+    let _ = ch.queue_delete(&ok.queue, QueueDeleteOpts::default()).await;
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_bind_and_unbind() {
+    let (conn, ch, queue) = setup("bind-unbind").await;
+
+    ch.queue_bind(&queue, "amq.direct", "test-key", Table::new())
+        .await
+        .unwrap();
+    ch.queue_unbind(&queue, "amq.direct", "test-key", Table::new())
+        .await
+        .unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+#[tokio::test]
+async fn queue_purge() {
+    let (conn, ch, queue) = setup("purge").await;
+
+    // Publish a few messages
+    for _ in 0..5 {
+        ch.basic_publish("", &queue, b"purge me", BasicProperties::default())
+            .await
+            .unwrap();
+    }
+
+    let purged = ch.queue_purge(&queue).await.unwrap();
+    assert_eq!(purged, 5);
+
+    teardown(ch, conn, &queue).await;
+}
+
+// -----------------------------------------------------------------------
+// Exchange tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn exchange_declare_and_delete() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    let ename = format!("amqp-client-rs-test-exch-{}", std::process::id());
+    ch.exchange_declare(&ename, "direct", ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+    ch.exchange_delete(&ename, false).await.unwrap();
+
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+// -----------------------------------------------------------------------
+// QoS tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn basic_qos() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    ch.basic_qos(10, false).await.unwrap();
+
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Transaction tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn tx_commit() {
+    let (conn, ch, queue) = setup("tx-commit").await;
+
+    ch.tx_select().await.unwrap();
+    ch.basic_publish("", &queue, b"tx msg", BasicProperties::default())
+        .await
+        .unwrap();
+    ch.tx_commit().await.unwrap();
+
+    let msg = ch.basic_get(&queue, false).await.unwrap().unwrap();
+    assert_eq!(msg.body.as_ref(), b"tx msg");
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue).await;
+}
+
+#[tokio::test]
+async fn tx_rollback() {
+    let (conn, ch, queue) = setup("tx-rollback").await;
+
+    ch.tx_select().await.unwrap();
+    ch.basic_publish("", &queue, b"rolled back", BasicProperties::default())
+        .await
+        .unwrap();
+    ch.tx_rollback().await.unwrap();
+
+    let msg = ch.basic_get(&queue, false).await.unwrap();
+    assert!(msg.is_none());
+
+    teardown(ch, conn, &queue).await;
+}
+
+// -----------------------------------------------------------------------
+// Confirm tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn confirm_select() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    ch.confirm_select().await.unwrap();
+
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Fluent wrapper tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn queue_fluent_wrapper() {
+    let (conn, ch, queue_name) = setup("fluent-q").await;
+
+    let q = ch.queue(&queue_name);
+    q.publish(b"fluent msg", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let msg = ch.basic_get(&queue_name, false).await.unwrap().unwrap();
+    assert_eq!(msg.body.as_ref(), b"fluent msg");
+    msg.ack().unwrap();
+
+    teardown(ch, conn, &queue_name).await;
+}
+
+#[tokio::test]
+async fn exchange_fluent_wrapper() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    let ename = format!("amqp-client-rs-test-fluent-exch-{}", std::process::id());
+    ch.exchange_declare(&ename, "direct", ExchangeDeclareOpts::default())
+        .await
+        .unwrap();
+
+    let ex = ch.exchange(&ename);
+    assert_eq!(ex.name(), ename);
+
+    // Clean up
+    ch.exchange_delete(&ename, false).await.unwrap();
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Recovery tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn basic_recover() {
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+
+    ch.basic_recover(true).await.unwrap();
+
+    ch.close().await.unwrap();
+    conn.close().await.unwrap();
+}
