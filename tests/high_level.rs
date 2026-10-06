@@ -616,3 +616,65 @@ async fn consumer_recovery_declares_a_deleted_exchange_again() {
         .await
         .unwrap();
 }
+
+/// A confirmed publish returns once the broker has acked it.
+#[tokio::test]
+async fn publish_confirmed_returns_once_acked() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .publish_confirmed("", &q.name(), &greeting(1))
+        .await
+        .unwrap();
+    let got = client.channel().basic_get(&q.name(), true).await.unwrap();
+    assert!(got.is_some(), "acked message is not in the queue");
+}
+
+/// A confirmed publish to a missing exchange fails for certain with the
+/// broker's 404; the next confirmed publish works on a new channel.
+#[tokio::test]
+async fn publish_confirmed_to_a_missing_exchange_fails() {
+    let client = json_client().await;
+    let missing = client
+        .publish_confirmed(&queue_name("no-such-ex"), "k", &greeting(1))
+        .await;
+    assert!(
+        matches!(missing, Err(Error::ChannelClosed { code: 404, .. })),
+        "{missing:?}"
+    );
+
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .publish_confirmed("", &q.name(), &greeting(2))
+        .await
+        .unwrap();
+}
+
+/// A publish the broker rejects (full queue with reject-publish) fails with
+/// `PublishNacked`.
+#[tokio::test]
+async fn publish_confirmed_reports_a_nack() {
+    let client = json_client().await;
+    let mut arguments = amqp_client_rs::Table::new();
+    arguments.insert(
+        amqp_client_rs::ShortStr::try_from("x-max-length").unwrap(),
+        amqp_client_rs::FieldValue::LongLongInt(1),
+    );
+    arguments.insert(
+        amqp_client_rs::ShortStr::try_from("x-overflow").unwrap(),
+        amqp_client_rs::FieldValue::LongStr(amqp_client_rs::LongStr::from("reject-publish")),
+    );
+    let opts = QueueDeclareOpts {
+        exclusive: true,
+        arguments,
+        ..Default::default()
+    };
+    let q = client.queue("", opts).await.unwrap();
+
+    client
+        .publish_confirmed("", &q.name(), &greeting(1))
+        .await
+        .unwrap();
+    let second = client.publish_confirmed("", &q.name(), &greeting(2)).await;
+    assert!(matches!(second, Err(Error::PublishNacked)), "{second:?}");
+}

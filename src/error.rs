@@ -44,6 +44,17 @@ pub enum Error {
 
     #[error("publisher confirms not enabled — call Channel::confirm_select first")]
     ConfirmsNotEnabled,
+
+    /// The broker nacked a confirmed publish: it did not take the message
+    /// (e.g. a full queue with `x-overflow: reject-publish`).
+    #[error("the broker rejected the publish (nack)")]
+    PublishNacked,
+
+    /// A confirmed publish was sent, but its confirm never arrived (the
+    /// connection was lost, or `rpc_timeout` passed). The broker may or may
+    /// not have the message; republishing may duplicate it.
+    #[error("publish outcome unknown: {reason}")]
+    ConfirmUncertain { reason: String },
 }
 
 #[derive(Debug)]

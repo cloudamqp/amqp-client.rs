@@ -7,7 +7,7 @@ use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
 use super::recovery::RecoveryConfig;
 use super::session::ClientInner;
-use crate::client::channel::{Channel, ExchangeDeclareOpts, QueueDeclareOpts};
+use crate::client::channel::{Channel, Confirmation, ExchangeDeclareOpts, QueueDeclareOpts};
 use crate::client::config::Config;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
@@ -155,6 +155,69 @@ impl<C: Codec> Client<C> {
                 Some(ShortStr::try_from(self.codec.content_type()).map_err(Error::Protocol)?);
         }
         self.publish_inner(exchange, routing_key, body, props).await
+    }
+
+    /// Publish a serialized message and wait until the broker confirms it.
+    ///
+    /// Returns `Ok` once acked, [`Error::PublishNacked`] if the broker
+    /// rejected it, and `ChannelClosed` if the broker closed the channel
+    /// instead (e.g. 404 for a missing exchange): in those cases the broker
+    /// does not have the message. [`Error::ConfirmUncertain`] means it was
+    /// sent but no confirm arrived (connection lost, or `rpc_timeout`
+    /// passed): the broker may or may not have it. With recovery on, a
+    /// publish that could not be sent because the connection was already
+    /// gone is sent once more on the recovered connection. Confirms are
+    /// requested on a channel of their own.
+    pub async fn publish_confirmed<T: serde::Serialize + 'static>(
+        &self,
+        exchange: &str,
+        routing_key: &str,
+        body: &T,
+    ) -> Result<(), Error> {
+        self.publish_confirmed_with_props(exchange, routing_key, body, BasicProperties::default())
+            .await
+    }
+
+    /// [`Client::publish_confirmed`] with custom properties. If they have no
+    /// `content_type`, the codec's is used.
+    pub async fn publish_confirmed_with_props<T: serde::Serialize + 'static>(
+        &self,
+        exchange: &str,
+        routing_key: &str,
+        body: &T,
+        mut props: BasicProperties,
+    ) -> Result<(), Error> {
+        if props.content_type.is_none() {
+            props.content_type =
+                Some(ShortStr::try_from(self.codec.content_type()).map_err(Error::Protocol)?);
+        }
+        let encoded = self.codec.encode(body)?;
+        // Errors here mean the message was not (fully) sent, so with_session
+        // may send it again on a recovered session.
+        let (channel, confirm) = self
+            .inner
+            .with_session(|s| {
+                let (encoded, props) = (encoded.clone(), props.clone());
+                async move {
+                    let channel = s.confirm_channel().await?;
+                    let confirm = channel
+                        .basic_publish_confirmed(exchange, routing_key, encoded, props, false)
+                        .await?;
+                    Ok((channel, confirm))
+                }
+            })
+            .await?;
+        match tokio::time::timeout(self.inner.rpc_timeout(), confirm).await {
+            Ok(Ok(Confirmation::Acked)) => Ok(()),
+            Ok(Ok(Confirmation::Nacked { .. })) => Err(Error::PublishNacked),
+            // The broker closed the channel: it discarded the message.
+            Ok(Err(e)) => Err(channel.closed_error().unwrap_or(Error::ConfirmUncertain {
+                reason: format!("connection lost before the confirm arrived: {e}"),
+            })),
+            Err(_) => Err(Error::ConfirmUncertain {
+                reason: "no confirm within rpc_timeout".into(),
+            }),
+        }
     }
 
     async fn publish_inner<T: serde::Serialize + 'static>(

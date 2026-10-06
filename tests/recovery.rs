@@ -288,3 +288,57 @@ async fn dropping_the_client_during_a_stalled_reconnect_ends_consumers() {
     assert!(matches!(ended, Ok(Ok(true))), "consumer did not end");
     delete_queue(&queue).await;
 }
+
+/// If the connection is lost after a confirmed publish was sent but before
+/// its ack, the outcome is uncertain.
+#[tokio::test]
+async fn publish_confirmed_is_uncertain_when_the_ack_is_lost() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    // Open the confirm channel while the proxy still forwards.
+    client
+        .publish_confirmed("", "amq.unrouted", &vec![0u8])
+        .await
+        .unwrap();
+    proxy.freeze();
+
+    let publish = tokio::spawn(async move {
+        client
+            .publish_confirmed("", "amq.unrouted", &vec![1u8])
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    proxy.cut();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), publish)
+        .await
+        .expect("publish_confirmed hung")
+        .unwrap();
+    assert!(
+        matches!(result, Err(Error::ConfirmUncertain { .. })),
+        "{result:?}"
+    );
+}
+
+/// A confirmed publish that could not be sent because the connection was
+/// already gone is sent once more on the recovered session.
+#[tokio::test]
+async fn publish_confirmed_is_retried_when_it_was_never_sent() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    let queue = name("confirm-retry");
+    client
+        .queue(&queue, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+
+    proxy.cut();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    client
+        .publish_confirmed("", &queue, &vec![1u8])
+        .await
+        .unwrap();
+    assert_eq!(depth(&queue).await, 1);
+    delete_queue(&queue).await;
+}

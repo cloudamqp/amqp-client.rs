@@ -24,11 +24,27 @@ pub(crate) struct Session {
     pub(crate) connection: Connection,
     /// Replaced by a new channel once the broker closes it.
     channel: Mutex<Arc<Channel>>,
+    /// The channel in confirm mode for `publish_confirmed`: opened on first
+    /// use, replaced once the broker closes it.
+    confirm_channel: tokio::sync::Mutex<Option<Arc<Channel>>>,
 }
 
 impl Session {
     pub(crate) fn channel(&self) -> Arc<Channel> {
         self.channel.lock().unwrap().clone()
+    }
+
+    /// The confirm-mode channel, opened (or reopened after the broker closed
+    /// it) on demand.
+    pub(crate) async fn confirm_channel(&self) -> Result<Arc<Channel>, Error> {
+        let mut slot = self.confirm_channel.lock().await;
+        if let Some(channel) = slot.as_ref().filter(|c| !c.is_closed()) {
+            return Ok(channel.clone());
+        }
+        let channel = Arc::new(self.connection.open_channel().await?);
+        channel.confirm_select().await?;
+        *slot = Some(channel.clone());
+        Ok(channel)
     }
 
     /// The channel, reopened first if the broker closed it (e.g. after a
@@ -99,6 +115,10 @@ impl ClientInner {
 
     pub(crate) fn recovery(&self) -> Option<&RecoveryConfig> {
         self.recovery.as_ref()
+    }
+
+    pub(crate) fn rpc_timeout(&self) -> Duration {
+        self.config.rpc_timeout
     }
 
     pub(crate) fn current(&self) -> Arc<Session> {
@@ -275,6 +295,7 @@ async fn open_session(
         generation,
         connection,
         channel: Mutex::new(channel),
+        confirm_channel: tokio::sync::Mutex::default(),
     })
 }
 
