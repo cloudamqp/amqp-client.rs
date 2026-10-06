@@ -80,6 +80,11 @@ impl Proxy {
         self.state.frozen.send_replace(true);
     }
 
+    /// Resumes forwarding, including on connections frozen so far.
+    pub fn unfreeze(&self) {
+        self.state.frozen.send_replace(false);
+    }
+
     /// Connections accepted so far, including ones closed while down.
     pub fn accepted(&self) -> usize {
         self.state.accepted.load(Ordering::SeqCst)
