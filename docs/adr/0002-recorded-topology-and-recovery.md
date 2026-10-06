@@ -22,9 +22,12 @@ session loss, never from a proactive health-check monitor. Concurrent observers
 coordinate through a single shared session slot carrying a monotonic **session
 generation**; the first operation to observe a stale generation claims recovery
 and spawns a single `Client`-owned **recovery task** that owns the forever-retry
-loop (connect → declare recorded topology → restore consumers → bump
-generation, else wait `RecoveryConfig::timeout` and retry). The triggering
-operation does not run that loop; it becomes an ordinary waiter. The task is
+loop (connect → declare recorded topology → bump generation, else wait
+`RecoveryConfig::timeout` and retry). The triggering operation does not run
+that loop; it becomes an ordinary waiter. Recoverable consumers are recovery
+waiters too: each one, on its next `next()`, waits for a newer generation and
+consumes again on it. The task does not restore them itself, because a pull
+consumer only receives while it is polled. The task is
 **demand-driven**: it runs only while there is demand (a live recoverable
 consumer, or an operation currently parked waiting) and stands down when demand
 reaches zero, leaving the next operation to re-trigger.

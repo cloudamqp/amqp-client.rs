@@ -106,11 +106,17 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
 ```
 
 The client records the exchanges, queues and bindings declared through it.
-With `.recovery(RecoveryConfig::default())` on the builder, a consumer whose
-channel is closed (e.g. consumer timeout) or whose queue is deleted declares
-the queue and its bindings again and consumes again. Recovery after losing the
-connection is designed in
-[ADR-0002](docs/adr/0002-recorded-topology-and-recovery.md) but not built yet.
+With `.recovery(RecoveryConfig::default())` on the builder
+([ADR-0002](docs/adr/0002-recorded-topology-and-recovery.md)):
+
+- After losing the connection, the client reconnects and declares the recorded
+  topology again; a server-named queue gets a new name, and `queue.name()` and
+  its bindings follow it. `publish` waits at most `RecoveryConfig::timeout`
+  (250 ms) for a new connection, then fails. Consumers carry on.
+- A consumer whose channel is closed (e.g. consumer timeout) or whose queue is
+  deleted declares the queue and its bindings again and consumes again.
+- Unacked messages are redelivered, so make handlers idempotent. Publishes are
+  not confirmed: one sent just as the connection drops can be lost.
 
 ## Requirements
 

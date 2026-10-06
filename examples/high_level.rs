@@ -53,7 +53,8 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
         .await?;
 
     // Without `.recovery(RecoveryConfig::default())` on the builder, the
-    // consumer ends (next() returns None) when its channel or connection does.
+    // consumer ends (next() returns None) when its channel or connection does;
+    // with it, the consumer carries on after reconnecting.
     while let Some(delivery) = consumer.next().await {
         println!("Received: {:?}", delivery.body);
         delivery.ack()?;

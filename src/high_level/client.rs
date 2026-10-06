@@ -20,12 +20,13 @@ use crate::protocol::types::ShortStr;
 /// which only handles `Vec<u8>`. Call [`ClientBuilder::codec`] to install a
 /// codec that handles your message types.
 ///
-/// The client connects once at [`ClientBuilder::build`] time and holds that
-/// connection for its lifetime. With [`ClientBuilder::recovery`], a consumer
-/// whose channel closes or whose queue is cancelled declares its queue and
-/// bindings again and consumes again. Recovery from losing the connection
-/// itself is not built yet: `publish` then returns an error and consumers'
-/// `next()` returns `None`.
+/// [`ClientBuilder::build`] connects once and fails fast. Without
+/// [`ClientBuilder::recovery`], losing the connection is terminal: `publish`
+/// returns an error and consumers' `next()` returns `None`. With it, the client
+/// reconnects and declares the recorded exchanges, queues and bindings again,
+/// operations wait at most `RecoveryConfig::timeout` for that, and consumers
+/// carry on, also after their channel closes or their queue is cancelled.
+/// Dropping the `Client` ends recovery and every consumer.
 ///
 /// Use [`Client::builder`] to create a new client.
 pub struct Client<C: Codec = ByteCodec> {

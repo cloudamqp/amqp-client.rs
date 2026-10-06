@@ -21,7 +21,7 @@ A monotonic counter identifying the current AMQP session; an operation that obse
 _Avoid_: Connection id, epoch, version
 
 **Recovery task**:
-The single task owned by the `Client` that runs the retry loop (connect, declare the recorded topology, restore recoverable consumers, bump the session generation) until it succeeds or recovery demand ends.
+The single task owned by the `Client` that runs the retry loop (connect, declare the recorded topology, bump the session generation) until it succeeds or recovery demand ends.
 _Avoid_: Reconnect loop, background monitor
 
 **Recovery waiter**:
@@ -33,7 +33,7 @@ The condition that keeps the recovery task running: at least one live recoverabl
 _Avoid_: Keepalive, active client
 
 **Recovery registry**:
-The `Client`-owned set of live recoverable consumers that the recovery task restores on each new AMQP session; a consumer leaves it when dropped.
+The `Client`'s count of live recoverable consumers, part of recovery demand; a consumer leaves it when dropped. Each consumer consumes again on the new AMQP session itself, on its next poll.
 _Avoid_: Subscription list, consumer cache
 
 **AMQP session**:
