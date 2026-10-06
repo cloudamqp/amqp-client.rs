@@ -20,7 +20,39 @@ use crate::error::Error;
 pub(crate) struct Session {
     pub(crate) generation: u64,
     pub(crate) connection: Connection,
-    pub(crate) channel: Arc<Channel>,
+    /// Replaced by a new channel once the broker closes it.
+    channel: Mutex<Arc<Channel>>,
+}
+
+impl Session {
+    pub(crate) fn channel(&self) -> Arc<Channel> {
+        self.channel.lock().unwrap().clone()
+    }
+
+    /// The channel, reopened first if the broker closed it (e.g. after a
+    /// publish to a missing exchange).
+    async fn open_channel(&self) -> Result<Arc<Channel>, Error> {
+        let channel = self.channel();
+        if !channel.is_closed() {
+            return Ok(channel);
+        }
+        let fresh = Arc::new(self.connection.open_channel().await?);
+        let mut current = self.channel.lock().unwrap();
+        if current.is_closed() {
+            *current = fresh;
+        }
+        Ok(current.clone())
+    }
+}
+
+/// Runs `op` on `session`, with its channel open.
+async fn run_on<R, F, Fut>(session: Arc<Session>, op: &F) -> Result<R, Error>
+where
+    F: Fn(Arc<Session>) -> Fut,
+    Fut: Future<Output = Result<R, Error>>,
+{
+    session.open_channel().await?;
+    op(session).await
 }
 
 /// The session slot. `waiters` and `consumers` are the recovery demand.
@@ -81,7 +113,7 @@ impl ClientInner {
         Fut: Future<Output = Result<R, Error>>,
     {
         let Some(timeout) = self.recovery.as_ref().map(|r| r.timeout) else {
-            return op(self.current()).await;
+            return run_on(self.current(), &op).await;
         };
         let session = {
             let slot = self.slot.lock().unwrap();
@@ -94,11 +126,11 @@ impl ClientInner {
                 session_after(Arc::downgrade(self), generation, Some(timeout)).await?
             }
         };
-        match op(session.clone()).await {
+        match run_on(session.clone(), &op).await {
             Err(Error::ConnectionClosed { .. }) => {
                 let next =
                     session_after(Arc::downgrade(self), session.generation, Some(timeout)).await?;
-                op(next).await
+                run_on(next, &op).await
             }
             result => result,
         }
@@ -227,7 +259,7 @@ async fn open_session(
     Ok(Session {
         generation,
         connection,
-        channel,
+        channel: Mutex::new(channel),
     })
 }
 

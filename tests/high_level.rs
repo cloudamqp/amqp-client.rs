@@ -552,3 +552,22 @@ async fn queue_delete_ends_its_consumers_with_recovery() {
     let ended = tokio::time::timeout(Duration::from_secs(5), consumer.next()).await;
     assert!(matches!(ended, Ok(None)), "consumer did not end");
 }
+
+/// Publishing to a missing exchange makes the broker close the client's
+/// channel; the client opens a new one for the next operation.
+#[tokio::test]
+async fn client_reopens_its_channel_after_the_broker_closes_it() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    client
+        .publish(&queue_name("missing-ex"), "k", &vec![1u8])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let q = tokio::time::timeout(Duration::from_secs(2), client.queue("", exclusive()))
+        .await
+        .expect("declare hung")
+        .unwrap();
+    client.publish("", &q.name(), &vec![1u8]).await.unwrap();
+    assert!(has_message(&client, &q.name()).await);
+}

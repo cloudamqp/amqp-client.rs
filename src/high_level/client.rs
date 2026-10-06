@@ -59,7 +59,7 @@ impl<C: Codec> Client<C> {
     /// (e.g. `queue_purge`, transactions). It is session-bound: nothing
     /// declared through it is recorded, and it is not restored by recovery.
     pub fn channel(&self) -> Arc<Channel> {
-        self.inner.current().channel.clone()
+        self.inner.current().channel()
     }
 
     /// Declare an exchange and record it, so it is declared again after
@@ -74,7 +74,7 @@ impl<C: Codec> Client<C> {
         self.inner
             .with_session(|s| {
                 let opts = opts.clone();
-                async move { s.channel.exchange_declare(name, kind, opts).await }
+                async move { s.channel().exchange_declare(name, kind, opts).await }
             })
             .await?;
         self.inner
@@ -112,7 +112,7 @@ impl<C: Codec> Client<C> {
             .inner
             .with_session(|s| {
                 let opts = opts.clone();
-                async move { s.channel.queue_declare(name, opts).await }
+                async move { s.channel().queue_declare(name, opts).await }
             })
             .await?;
         let id = self
@@ -169,7 +169,7 @@ impl<C: Codec> Client<C> {
             .with_session(|s| {
                 let (encoded, props) = (encoded.clone(), props.clone());
                 async move {
-                    s.channel
+                    s.channel()
                         .basic_publish(exchange, routing_key, encoded, props)
                         .await
                 }

@@ -72,7 +72,7 @@ impl<C: Codec> Queue<C> {
             .with_session(|s| {
                 let (name, arguments) = (self.name(), arguments.clone());
                 async move {
-                    s.channel
+                    s.channel()
                         .queue_bind(&name, exchange, routing_key, arguments)
                         .await
                 }
@@ -202,7 +202,7 @@ impl<C: Codec> Queue<C> {
             .client()?
             .with_session(|s| {
                 let (name, opts) = (self.name(), opts.clone());
-                async move { s.channel.queue_delete(&name, opts).await }
+                async move { s.channel().queue_delete(&name, opts).await }
             })
             .await?;
         self.topology.lock().unwrap().forget_queue(self.id);
@@ -227,7 +227,7 @@ impl<C: Codec> Queue<C> {
             .with_session(|s| {
                 let (name, arguments) = (self.name(), arguments.clone());
                 async move {
-                    s.channel
+                    s.channel()
                         .queue_unbind(&name, exchange, routing_key, arguments)
                         .await
                 }

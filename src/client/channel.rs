@@ -974,6 +974,11 @@ impl Channel {
         self.send_frame(Frame::Method(self.id, method))
     }
 
+    /// Whether the channel is closed on the broker.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.get().is_some()
+    }
+
     fn check_open(&self) -> Result<(), Error> {
         check_open(self.id, &self.closed)
     }
