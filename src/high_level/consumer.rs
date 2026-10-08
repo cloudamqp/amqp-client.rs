@@ -95,7 +95,12 @@ impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
                 self._registration = None;
                 return None;
             };
-            return Some(decode_delivery(self.queue.codec(), msg, self.opts.no_ack));
+            return Some(decode_delivery(
+                self.queue.codec(),
+                self.queue.encoder(),
+                msg,
+                self.opts.no_ack,
+            ));
         }
     }
 }

@@ -117,6 +117,16 @@ A delivery that fails to decode arrives as a `DecodeFailure` with the raw
 body. The client does not settle it: ack, reject or requeue it yourself
 ([ADR-0006](docs/adr/0006-consumer-returns-decode-failures.md)).
 
+The codec sees each message's properties, exchange and routing key, so it can
+pick the type to decode by e.g. the `type` property, and set it on publish
+([ADR-0004](docs/adr/0004-codec-decode-sees-message-metadata.md)).
+
+`content_encoding` is handled by the client, not the codec
+([ADR-0005](docs/adr/0005-content-encoding-is-a-client-layer.md)). By default
+a compressed delivery is a `DecodeFailure`. With the `compression` feature,
+`.encoding(Compression::gzip())` on the builder decodes `gzip` and `deflate`
+deliveries and publishes gzip.
+
 The client records the exchanges, queues and bindings declared through it.
 With `.recovery(RecoveryConfig::default())` on the builder
 ([ADR-0002](docs/adr/0002-recorded-topology-and-recovery.md)):

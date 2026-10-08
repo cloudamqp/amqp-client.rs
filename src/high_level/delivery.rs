@@ -1,4 +1,5 @@
 use super::codec::{Codec, MessageMeta};
+use super::encoding::ContentEncoder;
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
@@ -115,12 +116,13 @@ impl Settlement {
     }
 }
 
-/// Decodes `msg` with `codec`. A body that does not decode is handed back,
-/// unsettled, as a [`DecodeFailure`].
+/// Decodes `msg` with `encoder`, then `codec` (ADR-0005). A body that does
+/// not decode is handed back, unsettled, as a [`DecodeFailure`].
 // Both variants hold the delivery; boxing only the `Err` would not shrink it.
 #[allow(clippy::result_large_err)]
 pub(crate) fn decode_delivery<T, C>(
     codec: &C,
+    encoder: &dyn ContentEncoder,
     msg: DeliverMessage,
     no_ack: bool,
 ) -> Result<TypedDelivery<T>, DecodeFailure>
@@ -136,7 +138,9 @@ where
         exchange: &exchange,
         routing_key: &routing_key,
     };
-    let decoded = codec.decode::<T>(&msg.body, &meta);
+    let decoded = encoder
+        .decode(&msg.body, &meta)
+        .and_then(|body| codec.decode::<T>(&body, &meta));
     let (delivery_tag, redelivered) = (msg.delivery_tag, msg.redelivered);
     match decoded {
         Ok(body) => Ok(TypedDelivery {
@@ -167,6 +171,7 @@ mod tests {
     use crate::client::connection::OutgoingFrame;
     use crate::client::message::test_delivery;
     use crate::high_level::ByteCodec;
+    use crate::high_level::encoding::Identity;
     use crate::protocol::frame::Frame;
     use crate::protocol::method::MethodFrame;
 
@@ -234,14 +239,14 @@ mod tests {
             .build()
             .unwrap();
         let (msg, _rx) = test_delivery(b"", props);
-        let d = decode_delivery::<String, _>(&MetaCodec, msg, false).unwrap();
+        let d = decode_delivery::<String, _>(&MetaCodec, &Identity, msg, false).unwrap();
         assert_eq!(d.body, "amq.topic rmq.queues.host overview");
     }
 
     #[test]
     fn a_decodable_body_is_a_typed_delivery() {
         let (msg, _rx) = test_delivery(b"\"hi\"", BasicProperties::default());
-        let d = decode_delivery::<String, _>(&JsonCodec, msg, false).unwrap();
+        let d = decode_delivery::<String, _>(&JsonCodec, &Identity, msg, false).unwrap();
         assert_eq!(d.body, "hi");
         assert_eq!(d.delivery_tag, 42);
         assert_eq!(d.exchange, "amq.topic");
@@ -251,7 +256,7 @@ mod tests {
     #[test]
     fn an_undecodable_body_is_a_decode_failure_left_unsettled() {
         let (msg, mut rx) = test_delivery(b"not json", BasicProperties::default());
-        let f = decode_delivery::<String, _>(&JsonCodec, msg, false).unwrap_err();
+        let f = decode_delivery::<String, _>(&JsonCodec, &Identity, msg, false).unwrap_err();
         assert!(matches!(f.error, Error::Codec(_)));
         assert_eq!(f.body, b"not json");
         assert_eq!(f.delivery_tag, 42);
@@ -263,7 +268,7 @@ mod tests {
     #[test]
     fn a_decode_failure_can_be_rejected() {
         let (msg, mut rx) = test_delivery(b"x", BasicProperties::default());
-        let f = decode_delivery::<String, _>(&ByteCodec, msg, false).unwrap_err();
+        let f = decode_delivery::<String, _>(&ByteCodec, &Identity, msg, false).unwrap_err();
         f.reject(false).unwrap();
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -274,7 +279,7 @@ mod tests {
     #[test]
     fn a_typed_delivery_can_be_acked() {
         let (msg, mut rx) = test_delivery(b"x", BasicProperties::default());
-        let d = decode_delivery::<Vec<u8>, _>(&ByteCodec, msg, false).unwrap();
+        let d = decode_delivery::<Vec<u8>, _>(&ByteCodec, &Identity, msg, false).unwrap();
         d.ack().unwrap();
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -285,7 +290,7 @@ mod tests {
     #[test]
     fn settling_a_no_ack_delivery_errors_without_sending() {
         let (msg, mut rx) = test_delivery(b"x", BasicProperties::default());
-        let d = decode_delivery::<Vec<u8>, _>(&ByteCodec, msg, true).unwrap();
+        let d = decode_delivery::<Vec<u8>, _>(&ByteCodec, &Identity, msg, true).unwrap();
         assert!(matches!(d.ack(), Err(Error::NoAck)));
         assert!(matches!(d.nack(true), Err(Error::NoAck)));
         assert!(matches!(d.reject(false), Err(Error::NoAck)));
@@ -295,9 +300,53 @@ mod tests {
     #[test]
     fn settling_a_no_ack_decode_failure_errors_without_sending() {
         let (msg, mut rx) = test_delivery(b"x", BasicProperties::default());
-        let f = decode_delivery::<String, _>(&ByteCodec, msg, true).unwrap_err();
+        let f = decode_delivery::<String, _>(&ByteCodec, &Identity, msg, true).unwrap_err();
         assert!(matches!(f.ack(), Err(Error::NoAck)));
         assert!(matches!(f.reject(false), Err(Error::NoAck)));
         assert!(rx.try_recv().is_err(), "settled a no_ack delivery");
+    }
+
+    /// Decodes `rev` bodies by reversing them.
+    struct Reverse;
+
+    impl ContentEncoder for Reverse {
+        fn decode<'a>(
+            &self,
+            body: &'a [u8],
+            meta: &MessageMeta<'_>,
+        ) -> Result<std::borrow::Cow<'a, [u8]>, Error> {
+            assert_eq!(meta.routing_key, "rmq.queues.host");
+            let mut v = body.to_vec();
+            v.reverse();
+            Ok(v.into())
+        }
+
+        fn encode(&self, _: Vec<u8>, _: &mut BasicProperties) -> Result<Vec<u8>, Error> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn the_codec_decodes_what_the_encoder_decoded() {
+        let (msg, _rx) = test_delivery(b"\"ih\"", BasicProperties::default());
+        let d = decode_delivery::<String, _>(&JsonCodec, &Reverse, msg, false).unwrap();
+        assert_eq!(d.body, "hi");
+    }
+
+    #[test]
+    fn an_encoder_failure_skips_the_codec_and_keeps_the_wire_body() {
+        let props = BasicProperties::builder()
+            .content_encoding("gzip")
+            .build()
+            .unwrap();
+        let (msg, mut rx) = test_delivery(b"\"compressed\"", props);
+        let f = decode_delivery::<String, _>(&JsonCodec, &Identity, msg, false).unwrap_err();
+        assert!(
+            matches!(f.error, Error::ContentEncoding(_)),
+            "{:?}",
+            f.error
+        );
+        assert_eq!(f.body, b"\"compressed\"");
+        assert!(rx.try_recv().is_err(), "the client settled the failure");
     }
 }

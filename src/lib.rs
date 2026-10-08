@@ -44,9 +44,11 @@ pub use client::connection::Connection;
 pub use client::consumer::{CancellationReason, Consumer};
 pub use client::message::{DeliverMessage, GetMessage};
 pub use error::{Error, ProtocolError};
+#[cfg(feature = "compression")]
+pub use high_level::Compression;
 pub use high_level::{
-    ByteCodec, Client, ClientBuilder, Codec, DecodeFailure, Exchange, ExchangeKind, MessageMeta,
-    Queue, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
+    ByteCodec, Client, ClientBuilder, Codec, ContentEncoder, DecodeFailure, Exchange, ExchangeKind,
+    Identity, MessageMeta, Queue, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
 };
 pub use protocol::properties::BasicProperties;
 pub use protocol::table::{FieldValue, Table};

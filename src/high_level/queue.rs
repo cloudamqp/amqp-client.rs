@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::codec::{ByteCodec, Codec};
 use super::consumer::{SubscribeOpts, TypedConsumer};
+use super::encoding::ContentEncoder;
 use super::session::{ClientInner, Session};
 use super::topology::{QueueId, RecordedQueue, Topology};
 use crate::client::channel::{Channel, ConsumeOpts, QueueDeclareOpts, QueueDeleteOpts};
@@ -17,6 +18,7 @@ pub struct Queue<C: Codec = ByteCodec> {
     /// Weak, so queue handles and consumers never keep the client alive.
     client: Weak<ClientInner>,
     codec: Arc<C>,
+    encoder: Arc<dyn ContentEncoder>,
     /// The queue's operation lock, shared by every handle to it.
     lock: Arc<tokio::sync::Mutex<()>>,
     /// The last name seen, so `name()` still answers once it is deleted.
@@ -30,6 +32,7 @@ impl<C: Codec> Clone for Queue<C> {
             topology: self.topology.clone(),
             client: self.client.clone(),
             codec: self.codec.clone(),
+            encoder: self.encoder.clone(),
             lock: self.lock.clone(),
             last_name: self.last_name.clone(),
         }
@@ -37,7 +40,12 @@ impl<C: Codec> Clone for Queue<C> {
 }
 
 impl<C: Codec> Queue<C> {
-    pub(crate) fn new(id: QueueId, client: &Arc<ClientInner>, codec: Arc<C>) -> Self {
+    pub(crate) fn new(
+        id: QueueId,
+        client: &Arc<ClientInner>,
+        codec: Arc<C>,
+        encoder: Arc<dyn ContentEncoder>,
+    ) -> Self {
         let (lock, name) = {
             let topology = client.topology.lock().unwrap();
             let queue = topology.queue(id).expect("queue just recorded");
@@ -48,6 +56,7 @@ impl<C: Codec> Queue<C> {
             topology: client.topology.clone(),
             client: Arc::downgrade(client),
             codec,
+            encoder,
             lock,
             last_name: Arc::new(Mutex::new(name)),
         }
@@ -236,6 +245,10 @@ impl<C: Codec> Queue<C> {
 
     pub(crate) fn codec(&self) -> &C {
         &self.codec
+    }
+
+    pub(crate) fn encoder(&self) -> &dyn ContentEncoder {
+        &*self.encoder
     }
 
     /// Delete the queue and forget it and its bindings, so recovery does not

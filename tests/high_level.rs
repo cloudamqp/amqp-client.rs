@@ -262,6 +262,103 @@ async fn the_codec_sets_and_reads_message_properties() {
     f.reject(false).unwrap();
 }
 
+/// By default a compressed delivery is a decode failure carrying the
+/// compressed body (ADR-0005).
+#[tokio::test]
+async fn identity_returns_compressed_deliveries_as_failures() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let props = BasicProperties::builder()
+        .content_encoding("gzip")
+        .build()
+        .unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"\x1f\x8b...", props)
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(
+        matches!(f.error, Error::ContentEncoding(_)),
+        "{:?}",
+        f.error
+    );
+    assert_eq!(f.body, b"\x1f\x8b...");
+    f.reject(false).unwrap();
+}
+
+#[cfg(feature = "compression")]
+async fn gzip_client() -> Client {
+    Client::builder(AMQP_URI)
+        .unwrap()
+        .encoding(amqp_client_rs::Compression::gzip())
+        .build()
+        .await
+        .unwrap()
+}
+
+/// With `Compression`, bodies go out gzipped and come back decoded.
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compression_publishes_gzip_and_decodes_it() {
+    let client = gzip_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .publish("", &q.name(), &b"hello".to_vec())
+        .await
+        .unwrap();
+
+    let raw = client
+        .channel()
+        .basic_get(&q.name(), true)
+        .await
+        .unwrap()
+        .expect("no message");
+    let encoding = raw.properties.content_encoding.as_ref().unwrap();
+    assert_eq!(encoding.as_str().unwrap(), "gzip");
+    assert_eq!(&raw.body[..2], b"\x1f\x8b", "body is not gzip");
+
+    client
+        .publish("", &q.name(), &b"hello".to_vec())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.body, b"hello");
+    d.ack().unwrap();
+}
+
+/// A publish whose properties name another encoding fails before sending.
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compression_refuses_to_publish_under_another_encoding() {
+    let client = gzip_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let props = BasicProperties::builder()
+        .content_encoding("deflate")
+        .build()
+        .unwrap();
+    let result = client
+        .publish_with_props("", &q.name(), &b"hello".to_vec(), props)
+        .await;
+    assert!(
+        matches!(result, Err(Error::ContentEncoding(_))),
+        "{result:?}"
+    );
+    assert!(!has_message(&client, &q.name()).await, "it was sent");
+}
+
 /// With prefetch 1, the second message arrives only after the first is acked.
 #[tokio::test]
 async fn subscribe_applies_prefetch() {
