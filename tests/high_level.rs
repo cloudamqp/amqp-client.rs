@@ -1053,3 +1053,98 @@ async fn deleting_an_already_deleted_queue_succeeds() {
     assert!(matches!(subscribed, Err(Error::QueueDeleted { .. })));
     assert!(!queue_exists(&name).await);
 }
+
+// ---------------------------------------------------------------------------
+// TypedConsumer as a Stream
+// ---------------------------------------------------------------------------
+
+async fn stream_next<S: futures_util::Stream + Unpin>(stream: &mut S) -> Option<S::Item> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(Duration::from_secs(5), StreamExt::next(stream))
+        .await
+        .expect("stream yielded nothing")
+}
+
+/// A consumer is a `Stream` of deliveries, in order.
+#[tokio::test]
+async fn the_consumer_is_a_stream() {
+    use futures_util::StreamExt;
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    for n in 1..=3 {
+        client.publish("", &q.name(), &greeting(n)).await.unwrap();
+    }
+    let consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let bodies: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        consumer
+            .take(3)
+            .map(|r| {
+                let d = r.unwrap();
+                d.ack().unwrap();
+                d.body.value
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bodies, [1, 2, 3]);
+}
+
+/// The stream yields decode failures as items and carries on after them.
+#[tokio::test]
+async fn the_stream_yields_decode_failures() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"not json", BasicProperties::default())
+        .await
+        .unwrap();
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let f = stream_next(&mut consumer).await.unwrap().unwrap_err();
+    assert!(matches!(f.error, Error::Codec(_)), "{:?}", f.error);
+    f.reject(false).unwrap();
+    let d = stream_next(&mut consumer).await.unwrap().unwrap();
+    assert_eq!(d.body, greeting(2));
+    d.ack().unwrap();
+}
+
+/// The stream ends when its queue is deleted.
+#[tokio::test]
+async fn the_stream_ends_when_the_queue_is_deleted() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+    assert!(stream_next(&mut consumer).await.is_none());
+}
+
+/// With recovery, the stream carries on after its channel is closed.
+#[tokio::test]
+async fn the_stream_recovers_after_channel_closed() {
+    let client = recovering_json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    close_consumer_channel(&client, &q.name(), &mut consumer).await;
+
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let d = stream_next(&mut consumer).await.unwrap().unwrap();
+    assert_eq!(d.body, greeting(2));
+    d.ack().unwrap();
+}

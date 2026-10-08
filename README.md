@@ -117,6 +117,22 @@ A delivery that fails to decode arrives as a `DecodeFailure` with the raw
 body. The client does not settle it: ack, reject or requeue it yourself
 ([ADR-0006](docs/adr/0006-consumer-returns-decode-failures.md)).
 
+`TypedConsumer` is also a `futures::Stream` of the same items, so stream
+combinators work on it:
+
+```rust
+use futures::StreamExt;
+
+consumer
+    .for_each_concurrent(10, |r| async move {
+        match r {
+            Ok(d) => { handle(&d.body).await; let _ = d.ack(); }
+            Err(f) => { let _ = f.reject(false); }
+        }
+    })
+    .await;
+```
+
 The codec sees each message's properties, exchange and routing key, so it can
 pick the type to decode by e.g. the `type` property, and set it on publish
 ([ADR-0004](docs/adr/0004-codec-decode-sees-message-metadata.md)).

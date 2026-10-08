@@ -51,6 +51,14 @@ impl Consumer {
         self.rx.recv().await
     }
 
+    /// [`next`](Self::next), polled.
+    pub(crate) fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<DeliverMessage>> {
+        self.rx.poll_recv(cx)
+    }
+
     /// Why the consumer stream ended.
     ///
     /// Returns `Some(reason)` only after [`next`](Self::next) has returned

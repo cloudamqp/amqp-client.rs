@@ -25,9 +25,10 @@ and spawns a single `Client`-owned **recovery task** that owns the forever-retry
 loop (connect → declare recorded topology → bump generation, else wait
 `RecoveryConfig::timeout` and retry). The triggering operation does not run
 that loop; it becomes an ordinary waiter. Recoverable consumers are recovery
-waiters too: each one, on its next `next()`, waits for a newer generation and
-consumes again on it. The task does not restore them itself, because a pull
-consumer only receives while it is polled. The task is
+waiters too: each one, when polled (`next()` or as a `Stream`) and found
+ended, starts a recovery of its own that waits for a newer generation and
+consumes again on it. The client's task does not restore them itself, because
+a pull consumer only notices it ended when it is polled. The task is
 **demand-driven**: it runs only while there is demand (a live recoverable
 consumer, or an operation currently parked waiting) and stands down when demand
 reaches zero, leaving the next operation to re-trigger.
@@ -94,7 +95,8 @@ q.delete(QueueDeleteOpts::default()).await?;
   is declared anew only if the broker deleted it. `Queue::name()` and every
   recorded binding of that queue follow the new name.
 - **Consumer-level recovery** (`ChannelClosed`, `ServerCancel` while the session
-  is alive) runs inside the consumer's `next()`: open a channel, declare the
+  is alive) starts when the consumer is polled and runs as a task of its own,
+  owned by the consumer and aborted when it is dropped: open a channel, declare the
   queue, the recorded exchanges its bindings use (one may be gone too, e.g.
   auto-deleted), and its bindings, set prefetch, consume. On failure it waits
   `RecoveryConfig::timeout` (at least 100 ms, as for every retry) and retries. If it observes session loss, it becomes
@@ -146,6 +148,12 @@ q.delete(QueueDeleteOpts::default()).await?;
 - **Unbounded wait for recoverable consumers.** `next()` waits across recovery
   and resumes; dropping the consumer, deleting its queue through the handle, or
   dropping the `Client` ends it.
+- **A consumer's recovery outlives the poll that started it.** Once started it
+  carries on, whether or not the consumer is polled, so a consumer left
+  unpolled mid-recovery (a `next()` timed out or lost a `select!`) does not
+  hold its queue's lock and block a `delete`, and the next poll resumes it
+  instead of starting over. It is a spawned task rather than a future inside
+  the consumer for that reason.
 - **Session-bound handles and deliveries are not restored.** `Client::channel()`
   and any cloned `Arc<Channel>` are bound to the session that minted them.
   `ack`/`nack`/`reject` are never replayed; delivery is at-least-once, so
