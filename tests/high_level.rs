@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use amqp_client_rs::{
-    BasicProperties, Client, Codec, Connection, Error, ExchangeDeclareOpts, ExchangeKind,
-    QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
+    BasicProperties, Client, Codec, Connection, DecodeFailure, Error, ExchangeDeclareOpts,
+    ExchangeKind, QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts, TypedConsumer,
+    TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,7 @@ async fn next_within<T: serde::de::DeserializeOwned + 'static>(
         .await
         .ok()
         .flatten()
+        .map(|r| r.expect("delivery failed to decode"))
 }
 
 fn greeting(value: u32) -> Greeting {
@@ -127,6 +129,71 @@ async fn client_publish_with_props() {
     let corr = delivery.properties.correlation_id.as_ref().unwrap();
     assert_eq!(corr.as_str().unwrap(), "corr-abc-123");
     delivery.ack().unwrap();
+}
+
+#[allow(clippy::result_large_err)]
+async fn next_raw<T: serde::de::DeserializeOwned + 'static>(
+    consumer: &mut TypedConsumer<T, JsonCodec>,
+) -> Result<TypedDelivery<T>, DecodeFailure> {
+    tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .expect("no message")
+        .expect("consumer ended")
+}
+
+/// A body the codec cannot decode reaches the caller unsettled (ADR-0006): it
+/// is redelivered when nacked with requeue, and gone once rejected.
+#[tokio::test]
+async fn an_undecodable_delivery_is_left_to_the_caller() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"not json", BasicProperties::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(matches!(f.error, Error::Codec(_)), "{:?}", f.error);
+    assert_eq!(f.body, b"not json");
+    assert!(!f.redelivered);
+    f.nack(true).unwrap();
+
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(f.redelivered);
+    f.reject(false).unwrap();
+
+    client.publish("", &q.name(), &greeting(1)).await.unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert_eq!(d.body, greeting(1), "the rejected delivery came back");
+    d.ack().unwrap();
+}
+
+/// Settling a delivery from a `no_ack` consumer fails locally and leaves the
+/// consumer running.
+#[tokio::test]
+async fn settling_a_no_ack_delivery_keeps_the_consumer() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts {
+            no_ack: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    client.publish("", &q.name(), &greeting(1)).await.unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert!(matches!(d.ack(), Err(Error::NoAck)));
+
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert_eq!(d.body, greeting(2));
 }
 
 /// With prefetch 1, the second message arrives only after the first is acked.

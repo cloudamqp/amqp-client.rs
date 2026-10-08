@@ -179,7 +179,8 @@ async fn consumer_survives_connection_loss() {
     let mut received = false;
     for _ in 0..50 {
         let _ = client.publish("", &queue, &vec![7u8]).await;
-        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(100), consumer.next()).await
+        if let Ok(Some(Ok(d))) =
+            tokio::time::timeout(Duration::from_millis(100), consumer.next()).await
         {
             assert_eq!(d.body, vec![7u8]);
             d.ack().unwrap();

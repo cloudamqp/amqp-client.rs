@@ -60,6 +60,11 @@ pub enum Error {
     /// the broker.
     #[error("queue {name} was deleted")]
     QueueDeleted { name: String },
+
+    /// A delivery from a `no_ack` consumer was acked, nacked or rejected.
+    /// Nothing was sent: the broker would close the channel.
+    #[error("the delivery came from a no_ack consumer and cannot be settled")]
+    NoAck,
 }
 
 #[derive(Debug)]

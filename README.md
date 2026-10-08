@@ -98,12 +98,24 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
         .subscribe::<String>(SubscribeOpts { prefetch: 50, ..Default::default() })
         .await?;
     while let Some(delivery) = consumer.next().await {
-        println!("Received: {}", delivery.body);
-        delivery.ack()?;
+        match delivery {
+            Ok(d) => {
+                println!("Received: {}", d.body);
+                d.ack()?;
+            }
+            Err(f) => {
+                println!("Undecodable: {}", f.error);
+                f.reject(false)?;
+            }
+        }
     }
     Ok(())
 }
 ```
+
+A delivery that fails to decode arrives as a `DecodeFailure` with the raw
+body. The client does not settle it: ack, reject or requeue it yourself
+([ADR-0006](docs/adr/0006-consumer-returns-decode-failures.md)).
 
 The client records the exchanges, queues and bindings declared through it.
 With `.recovery(RecoveryConfig::default())` on the builder

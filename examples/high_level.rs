@@ -56,8 +56,17 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
     // consumer ends (next() returns None) when its channel or connection does;
     // with it, the consumer carries on after reconnecting.
     while let Some(delivery) = consumer.next().await {
-        println!("Received: {:?}", delivery.body);
-        delivery.ack()?;
+        match delivery {
+            Ok(d) => {
+                println!("Received: {:?}", d.body);
+                d.ack()?;
+            }
+            // Not decodable: the client leaves it to us to settle.
+            Err(f) => {
+                println!("Undecodable delivery: {}", f.error);
+                f.reject(false)?;
+            }
+        }
     }
 
     Ok(())
