@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Content encoding is a client layer

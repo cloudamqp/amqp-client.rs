@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Codec sees message metadata
