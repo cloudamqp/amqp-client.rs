@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use amqp_client_rs::{
     BasicProperties, Client, Codec, Connection, DecodeFailure, Error, ExchangeDeclareOpts,
-    ExchangeKind, QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts, TypedConsumer,
-    TypedDelivery,
+    ExchangeKind, MessageMeta, QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts,
+    TypedConsumer, TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,11 +20,19 @@ impl Codec for JsonCodec {
         "application/json"
     }
 
-    fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>, Error> {
+    fn encode<T: serde::Serialize>(
+        &self,
+        value: &T,
+        _props: &mut BasicProperties,
+    ) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
     }
 
-    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Error> {
+    fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        bytes: &[u8],
+        _meta: &MessageMeta<'_>,
+    ) -> Result<T, Error> {
         serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
     }
 }
@@ -132,8 +140,8 @@ async fn client_publish_with_props() {
 }
 
 #[allow(clippy::result_large_err)]
-async fn next_raw<T: serde::de::DeserializeOwned + 'static>(
-    consumer: &mut TypedConsumer<T, JsonCodec>,
+async fn next_raw<T: serde::de::DeserializeOwned + 'static, C: Codec>(
+    consumer: &mut TypedConsumer<T, C>,
 ) -> Result<TypedDelivery<T>, DecodeFailure> {
     tokio::time::timeout(Duration::from_secs(5), consumer.next())
         .await
@@ -194,6 +202,64 @@ async fn settling_a_no_ack_delivery_keeps_the_consumer() {
     client.publish("", &q.name(), &greeting(2)).await.unwrap();
     let d = next_raw(&mut consumer).await.unwrap();
     assert_eq!(d.body, greeting(2));
+}
+
+/// JSON that sets `type` on encode and decodes only messages of that type.
+struct TypedJsonCodec;
+
+impl Codec for TypedJsonCodec {
+    fn content_type(&self) -> &str {
+        "application/json"
+    }
+
+    fn encode<T: serde::Serialize + 'static>(
+        &self,
+        value: &T,
+        props: &mut BasicProperties,
+    ) -> Result<Vec<u8>, Error> {
+        props.type_field = Some("greeting".try_into().unwrap());
+        JsonCodec.encode(value, props)
+    }
+
+    fn decode<T: serde::de::DeserializeOwned + 'static>(
+        &self,
+        bytes: &[u8],
+        meta: &MessageMeta<'_>,
+    ) -> Result<T, Error> {
+        match meta.properties.type_field.as_ref().map(|t| t.as_str()) {
+            Some(Ok("greeting")) => JsonCodec.decode(bytes, meta),
+            other => Err(Error::Codec(format!("unknown type {other:?}"))),
+        }
+    }
+}
+
+/// What the codec sets on publish reaches the consumer's codec (ADR-0004).
+#[tokio::test]
+async fn the_codec_sets_and_reads_message_properties() {
+    let client = Client::builder(AMQP_URI)
+        .unwrap()
+        .codec(TypedJsonCodec)
+        .build()
+        .await
+        .unwrap();
+    let q = client.queue("", exclusive()).await.unwrap();
+    client.publish("", &q.name(), &greeting(7)).await.unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"{}", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert_eq!(d.body, greeting(7));
+    d.ack().unwrap();
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(matches!(f.error, Error::Codec(_)), "{:?}", f.error);
+    f.reject(false).unwrap();
 }
 
 /// With prefetch 1, the second message arrives only after the first is acked.

@@ -9,7 +9,7 @@ mod session;
 mod topology;
 
 pub use client::{Client, ClientBuilder};
-pub use codec::{ByteCodec, Codec};
+pub use codec::{ByteCodec, Codec, MessageMeta};
 pub use consumer::{SubscribeOpts, TypedConsumer};
 pub use delivery::{DecodeFailure, TypedDelivery};
 pub use exchange::{Exchange, ExchangeKind};

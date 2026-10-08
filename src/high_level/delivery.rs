@@ -1,4 +1,4 @@
-use super::codec::Codec;
+use super::codec::{Codec, MessageMeta};
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
@@ -128,10 +128,15 @@ where
     T: serde::de::DeserializeOwned + 'static,
     C: Codec,
 {
-    let decoded = codec.decode::<T>(&msg.body);
     let properties = msg.properties.clone();
     let exchange = msg.exchange.to_string();
     let routing_key = msg.routing_key.to_string();
+    let meta = MessageMeta {
+        properties: &properties,
+        exchange: &exchange,
+        routing_key: &routing_key,
+    };
+    let decoded = codec.decode::<T>(&msg.body, &meta);
     let (delivery_tag, redelivered) = (msg.delivery_tag, msg.redelivered);
     match decoded {
         Ok(body) => Ok(TypedDelivery {
@@ -172,16 +177,65 @@ mod tests {
             "application/json"
         }
 
-        fn encode<T: serde::Serialize + 'static>(&self, value: &T) -> Result<Vec<u8>, Error> {
+        fn encode<T: serde::Serialize + 'static>(
+            &self,
+            value: &T,
+            _props: &mut BasicProperties,
+        ) -> Result<Vec<u8>, Error> {
             serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
         }
 
         fn decode<T: serde::de::DeserializeOwned + 'static>(
             &self,
             bytes: &[u8],
+            _meta: &MessageMeta<'_>,
         ) -> Result<T, Error> {
             serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
         }
+    }
+
+    /// Decodes any body to "<exchange> <routing key> <type>".
+    struct MetaCodec;
+
+    impl Codec for MetaCodec {
+        fn content_type(&self) -> &str {
+            "text/plain"
+        }
+
+        fn encode<T: serde::Serialize + 'static>(
+            &self,
+            _value: &T,
+            _props: &mut BasicProperties,
+        ) -> Result<Vec<u8>, Error> {
+            unreachable!()
+        }
+
+        fn decode<T: serde::de::DeserializeOwned + 'static>(
+            &self,
+            _bytes: &[u8],
+            meta: &MessageMeta<'_>,
+        ) -> Result<T, Error> {
+            let kind = meta.properties.type_field.as_ref().unwrap();
+            let s = format!(
+                "{} {} {}",
+                meta.exchange,
+                meta.routing_key,
+                kind.as_str().unwrap()
+            );
+            serde_json::from_value(serde_json::Value::String(s))
+                .map_err(|e| Error::Codec(e.to_string()))
+        }
+    }
+
+    #[test]
+    fn the_codec_sees_the_delivery_metadata() {
+        let props = BasicProperties::builder()
+            .type_field("overview")
+            .build()
+            .unwrap();
+        let (msg, _rx) = test_delivery(b"", props);
+        let d = decode_delivery::<String, _>(&MetaCodec, msg, false).unwrap();
+        assert_eq!(d.body, "amq.topic rmq.queues.host overview");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use amqp_client_rs::{Client, QueueDeclareOpts, SubscribeOpts};
+use amqp_client_rs::{BasicProperties, Client, MessageMeta, QueueDeclareOpts, SubscribeOpts};
 use serde::{Deserialize, Serialize};
 
 // Bring your own codec (e.g. JSON via serde_json)
@@ -8,12 +8,19 @@ impl amqp_client_rs::Codec for JsonCodec {
     fn content_type(&self) -> &str {
         "application/json"
     }
-    fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, amqp_client_rs::Error> {
+    // `props` and `meta` let a codec set and read e.g. the `type` property;
+    // this one only needs the body.
+    fn encode<T: Serialize>(
+        &self,
+        value: &T,
+        _props: &mut BasicProperties,
+    ) -> Result<Vec<u8>, amqp_client_rs::Error> {
         serde_json::to_vec(value).map_err(|e| amqp_client_rs::Error::Codec(e.to_string()))
     }
     fn decode<T: serde::de::DeserializeOwned>(
         &self,
         bytes: &[u8],
+        _meta: &MessageMeta<'_>,
     ) -> Result<T, amqp_client_rs::Error> {
         serde_json::from_slice(bytes).map_err(|e| amqp_client_rs::Error::Codec(e.to_string()))
     }

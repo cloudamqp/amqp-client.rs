@@ -142,7 +142,8 @@ impl<C: Codec> Client<C> {
     /// Publish a serialized message with custom properties.
     ///
     /// If the provided properties do not already have a `content_type` set, the
-    /// codec's content type is used.
+    /// codec's content type is used. The codec's `encode` may add to or
+    /// overwrite them.
     pub async fn publish_with_props<T: serde::Serialize + 'static>(
         &self,
         exchange: &str,
@@ -193,7 +194,7 @@ impl<C: Codec> Client<C> {
             props.content_type =
                 Some(ShortStr::try_from(self.codec.content_type()).map_err(Error::Protocol)?);
         }
-        let encoded = self.codec.encode(body)?;
+        let encoded = self.codec.encode(body, &mut props)?;
         // Errors here mean the message was not (fully) sent, so with_session
         // may send it again on a recovered session.
         let (channel, confirm) = self
@@ -223,9 +224,9 @@ impl<C: Codec> Client<C> {
         exchange: &str,
         routing_key: &str,
         body: &T,
-        props: BasicProperties,
+        mut props: BasicProperties,
     ) -> Result<(), Error> {
-        let encoded = self.codec.encode(body)?;
+        let encoded = self.codec.encode(body, &mut props)?;
         self.inner
             .with_session(|s| {
                 let (encoded, props) = (encoded.clone(), props.clone());
