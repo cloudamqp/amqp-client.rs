@@ -372,7 +372,7 @@ impl Connection {
 
         // Negotiate parameters
         let channel_max = negotiate(config.channel_max, tune.channel_max);
-        let frame_max = negotiate_u32(config.frame_max, tune.frame_max);
+        let frame_max = negotiate_frame_max(config.frame_max, tune.frame_max);
         let heartbeat = negotiate(config.heartbeat, tune.heartbeat);
 
         // Send Connection.TuneOk
@@ -1095,6 +1095,15 @@ fn negotiate_u32(client: u32, server: u32) -> u32 {
     }
 }
 
+/// Negotiate `frame_max`, raised to the spec minimum: a frame must have room
+/// for its 8 bytes of overhead plus some body.
+fn negotiate_frame_max(client: u32, server: u32) -> u32 {
+    match negotiate_u32(client, server) {
+        0 => 0,
+        n => n.max(MIN_FRAME_MAX),
+    }
+}
+
 /// Install the rustls `ring` crypto provider as the process-wide default,
 /// once. rustls 0.23 panics if `ClientConfig::builder()` is called before a
 /// provider is installed *and* the build has more than one provider feature
@@ -1158,6 +1167,18 @@ mod tests {
     fn negotiate_u32_picks_minimum() {
         assert_eq!(negotiate_u32(65536, 131072), 65536);
         assert_eq!(negotiate_u32(131072, 65536), 65536);
+    }
+
+    #[test]
+    fn negotiate_frame_max_raises_a_tiny_value_to_the_spec_minimum() {
+        assert_eq!(negotiate_frame_max(8, 131072), MIN_FRAME_MAX);
+        assert_eq!(negotiate_frame_max(0, 8), MIN_FRAME_MAX);
+    }
+
+    #[test]
+    fn negotiate_frame_max_keeps_zero_and_larger_values() {
+        assert_eq!(negotiate_frame_max(0, 0), 0);
+        assert_eq!(negotiate_frame_max(65536, 131072), 65536);
     }
 
     /// Records the size of every write.
