@@ -1321,11 +1321,16 @@ async fn dispatch_loop(
                     reason = %close.reply_text,
                     "server closing channel"
                 );
-                let pending_confirms = confirms_state.lock().unwrap().pending.len();
-                let _ = closed.set(ChannelClose {
-                    pending_confirms,
-                    ..ChannelClose::new(close.reply_code, close.reply_text.to_string())
-                });
+                // Closed under the confirms lock, which publishers hold from
+                // `check_open` until their confirm is registered: no publish
+                // can get in after the count.
+                {
+                    let confirms = confirms_state.lock().unwrap();
+                    let _ = closed.set(ChannelClose {
+                        pending_confirms: confirms.pending.len(),
+                        ..ChannelClose::new(close.reply_code, close.reply_text.to_string())
+                    });
+                }
                 let close_ok = Frame::Method(channel_id, MethodFrame::ChannelCloseOk);
                 let _ = shared.frame_tx.send(OutgoingFrame::Frame(close_ok));
                 set_cancellation_for_all(
@@ -2179,5 +2184,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(confirm.delivery_tag(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_confirms_at_close_counts_every_accepted_publish() {
+        for _ in 0..500 {
+            let (channel, _rx, incoming_tx) = channel_with_queues(4096);
+            enable_confirms(&channel);
+            let publishers: Vec<_> = (0..2)
+                .map(|_| {
+                    let channel = channel.clone();
+                    tokio::spawn(async move {
+                        let mut accepted = 0;
+                        while channel
+                            .basic_publish_confirmed(
+                                "",
+                                "q",
+                                "x",
+                                BasicProperties::default(),
+                                false,
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            accepted += 1;
+                        }
+                        accepted
+                    })
+                })
+                .collect();
+            tokio::task::yield_now().await;
+            let close = ch_method::Close {
+                reply_code: 404,
+                reply_text: ShortStr::try_from("NOT_FOUND").unwrap(),
+                class_id: 60,
+                method_id: 40,
+            };
+            incoming_tx
+                .send(Frame::Method(1, MethodFrame::ChannelClose(close)))
+                .unwrap();
+            let mut accepted = 0;
+            for publisher in publishers {
+                accepted += publisher.await.unwrap();
+            }
+            assert_eq!(channel.pending_confirms_at_close(), Some(accepted));
+        }
     }
 }
