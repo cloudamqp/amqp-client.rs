@@ -107,6 +107,40 @@ async fn publish_large_body() {
     teardown(ch, conn, &queue).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_publishes_on_one_channel() {
+    let (conn, ch, queue) = setup("pub-concurrent").await;
+    let ch = std::sync::Arc::new(ch);
+
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let (ch, queue) = (ch.clone(), queue.clone());
+            tokio::spawn(async move {
+                for _ in 0..500 {
+                    ch.basic_publish("", &queue, b"hello", BasicProperties::default())
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    // A passive declare is an RPC behind every publish on the channel: it
+    // fails if the broker closed the channel over an interleaved frame.
+    let passive = QueueDeclareOpts {
+        passive: true,
+        ..Default::default()
+    };
+    let ok = ch.queue_declare(&queue, passive).await.unwrap();
+    assert_eq!(ok.message_count, 8 * 500);
+
+    let ch = std::sync::Arc::into_inner(ch).unwrap();
+    teardown(ch, conn, &queue).await;
+}
+
 #[tokio::test]
 async fn publish_empty_body() {
     let (conn, ch, queue) = setup("pub-empty").await;

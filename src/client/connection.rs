@@ -27,12 +27,13 @@ use crate::protocol::types::{LongStr, ShortStr};
 /// Outgoing frame or control message for the writer task.
 pub(crate) enum OutgoingFrame {
     Frame(Frame),
-    /// A frame carrying a publish-admission permit. The writer drops the
-    /// permit only after `write_all` succeeds for this frame's bytes,
-    /// providing genuine end-to-end backpressure: a publisher cannot enqueue
-    /// more than `publish_admission_bytes` worth of content frames into the
-    /// socket / kernel send queue at any time.
-    FrameWithPermit(Frame, tokio::sync::OwnedSemaphorePermit),
+    /// A publish's method, header and body frames, queued as one item so no
+    /// other frame gets between them. Carries its publish-admission permit,
+    /// if any. The writer drops the permit only after `write_all` succeeds
+    /// for the frames' bytes, providing genuine end-to-end backpressure: a
+    /// publisher cannot enqueue more than `publish_admission_bytes` worth of
+    /// content frames into the socket / kernel send queue at any time.
+    Publish(Vec<Frame>, Option<tokio::sync::OwnedSemaphorePermit>),
     Shutdown,
 }
 
@@ -792,8 +793,8 @@ const WRITER_BATCH_FRAMES: usize = 256;
 /// batching that's three syscalls. Draining the mpsc with `recv_many` and
 /// encoding into a single contiguous buffer collapses that to one syscall
 /// and works much better with TLS records on the wire.
-async fn writer_loop(
-    mut write_half: tokio::io::WriteHalf<MaybeTls>,
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut write_half: W,
     mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingFrame>,
 ) {
     let mut write_buf = BytesMut::with_capacity(WRITER_BATCH_BYTES);
@@ -815,27 +816,33 @@ async fn writer_loop(
         let mut held_permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
         let mut shutdown = false;
         for item in drained.drain(..) {
-            match item {
-                OutgoingFrame::Frame(frame) => frame.encode(&mut write_buf),
-                OutgoingFrame::FrameWithPermit(frame, permit) => {
+            let result = match item {
+                OutgoingFrame::Frame(frame) => {
                     frame.encode(&mut write_buf);
-                    held_permits.push(permit);
+                    flush_if_full(&mut write_half, &mut write_buf, &mut held_permits).await
+                }
+                OutgoingFrame::Publish(frames, permit) => {
+                    let result = async {
+                        for frame in frames {
+                            frame.encode(&mut write_buf);
+                            flush_if_full(&mut write_half, &mut write_buf, &mut held_permits)
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    // Held until the publish's last frame is written.
+                    held_permits.extend(permit);
+                    result
                 }
                 OutgoingFrame::Shutdown => {
                     shutdown = true;
                     break;
                 }
-            }
-            // Soft byte cap: flush what we have and start a fresh batch so
-            // a single huge body doesn't pin the buffer.
-            if write_buf.len() >= WRITER_BATCH_BYTES {
-                if let Err(e) = write_half.write_all(&write_buf).await {
-                    error!(error = %e, "write error");
-                    return;
-                }
-                write_buf.clear();
-                // Release permits for frames whose bytes have hit the socket.
-                held_permits.clear();
+            };
+            if let Err(e) = result {
+                error!(error = %e, "write error");
+                return;
             }
         }
         if !write_buf.is_empty() {
@@ -853,6 +860,22 @@ async fn writer_loop(
         // even if the mpsc is permanently saturated.
         tokio::task::yield_now().await;
     }
+}
+
+/// Soft byte cap: writes the buffer once it reaches `WRITER_BATCH_BYTES` and
+/// starts a fresh batch, so a single huge body doesn't pin the buffer.
+/// Releases the permits of the publishes whose bytes have hit the socket.
+async fn flush_if_full<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
+    write_buf: &mut BytesMut,
+    held_permits: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
+) -> std::io::Result<()> {
+    if write_buf.len() >= WRITER_BATCH_BYTES {
+        write_half.write_all(write_buf).await?;
+        write_buf.clear();
+        held_permits.clear();
+    }
+    Ok(())
 }
 
 /// Delivers a frame to its channel. A cached sender may be stale: its channel
@@ -1135,6 +1158,49 @@ mod tests {
     fn negotiate_u32_picks_minimum() {
         assert_eq!(negotiate_u32(65536, 131072), 65536);
         assert_eq!(negotiate_u32(131072, 65536), 65536);
+    }
+
+    /// Records the size of every write.
+    struct RecordingWriter(Arc<Mutex<Vec<usize>>>);
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_flushes_a_large_publish_in_batch_sized_writes() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let frame = vec![0u8; 4096];
+        let bodies = (0..256).map(|_| Frame::Body(1, frame.clone().into()));
+        tx.send(OutgoingFrame::Publish(bodies.collect(), None))
+            .unwrap();
+        tx.send(OutgoingFrame::Shutdown).unwrap();
+
+        writer_loop(RecordingWriter(writes.clone()), rx).await;
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.iter().sum::<usize>(), 256 * (4096 + 8));
+        let largest = writes.iter().max().unwrap();
+        assert!(
+            *largest < WRITER_BATCH_BYTES + 4096 + 8,
+            "largest write was {largest} bytes"
+        );
     }
 
     #[test]

@@ -646,24 +646,20 @@ impl Channel {
             immediate: false,
         });
 
-        self.send_frame(Frame::Method(self.id, method))?;
-        self.send_frame(Frame::Header(
-            self.id,
-            Box::new(ContentHeader {
-                class_id: 60,
-                body_size: body.len() as u64,
-                properties: props,
-            }),
-        ))?;
-
-        self.send_body_frames(body.clone(), permit)?;
+        let body_len = body.len();
+        let frames = self.content_frames(method, props, body);
+        {
+            let mut confirms = self.confirms_state.lock().unwrap();
+            self.send_content(frames, permit)?;
+            // In confirm mode the broker numbers this publish too.
+            if confirms.enabled {
+                confirms.next_seq += 1;
+            }
+        }
 
         trace!(
             channel_id = self.id,
-            exchange,
-            routing_key,
-            body_len = body.len(),
-            "message published"
+            exchange, routing_key, body_len, "message published"
         );
         Ok(())
     }
@@ -866,45 +862,22 @@ impl Channel {
             immediate: false,
         });
 
-        // Allocate sequence number, register oneshot, send frames. Take and
-        // release the confirms_state lock around the registration only — we
-        // must not hold it across the awaits below.
+        let frames = self.content_frames(method, props, body);
         let (delivery_tag, rx) = {
             let mut state = self.confirms_state.lock().unwrap();
             if !state.enabled {
                 return Err(Error::ConfirmsNotEnabled);
             }
+            // Queued under the lock, so the broker numbers publishes in the
+            // order their tags were taken. Sending never awaits. Registered
+            // after: the dispatch task takes this lock to resolve the confirm.
+            self.send_content(frames, permit)?;
             let delivery_tag = state.next_seq;
             state.next_seq += 1;
             let (tx, rx) = tokio::sync::oneshot::channel();
             state.pending.insert(delivery_tag, tx);
             (delivery_tag, rx)
         };
-
-        // From here on, errors must un-register the oneshot or the BTreeMap
-        // leaks. A failed send means the broker got an incomplete message at
-        // most, which it never routes.
-        let sent = self
-            .send_frame(Frame::Method(self.id, method))
-            .and_then(|()| {
-                self.send_frame(Frame::Header(
-                    self.id,
-                    Box::new(ContentHeader {
-                        class_id: 60,
-                        body_size: body.len() as u64,
-                        properties: props,
-                    }),
-                ))
-            })
-            .and_then(|()| self.send_body_frames(body, permit));
-        if let Err(e) = sent {
-            self.confirms_state
-                .lock()
-                .unwrap()
-                .pending
-                .remove(&delivery_tag);
-            return Err(e);
-        }
 
         Ok(PublishConfirm { delivery_tag, rx })
     }
@@ -1037,66 +1010,47 @@ impl Channel {
         Ok(Some(permit))
     }
 
-    /// Chunk and send a body. The optional permit is attached to the LAST
-    /// body frame so it stays held until that frame's bytes hit the socket.
-    fn send_body_frames(
+    /// A publish's frames: method, header, then the body split to fit
+    /// `frame_max`.
+    fn content_frames(
         &self,
+        method: MethodFrame,
+        props: BasicProperties,
         body: Bytes,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    ) -> Result<(), Error> {
-        if body.is_empty() {
-            // No body, nothing to send. Drop any permit (shouldn't be Some,
-            // but be defensive).
-            drop(permit);
-            return Ok(());
-        }
+    ) -> Vec<Frame> {
+        let header = Frame::Header(
+            self.id,
+            Box::new(ContentHeader {
+                class_id: 60,
+                body_size: body.len() as u64,
+                properties: props,
+            }),
+        );
+        let mut frames = vec![Frame::Method(self.id, method), header];
         let max_body_size = if self.frame_max > 0 {
             (self.frame_max as usize).saturating_sub(8)
         } else {
             body.len()
         };
-
-        if body.len() <= max_body_size {
-            // Single-frame fast path: ship the whole body in one frame and
-            // attach the permit (if any) so the writer releases after this
-            // frame's bytes are on the wire.
-            self.send_body_with_optional_permit(Frame::Body(self.id, body), permit)?;
-            return Ok(());
-        }
-
-        // Chunked path: send all-but-last as plain Body frames, then attach
-        // the permit to the last chunk only. This way the permit isn't
-        // released until the entire body has been written.
-        let mut offset = 0usize;
-        let mut held_permit = permit;
+        let mut offset = 0;
         while offset < body.len() {
             let end = (offset + max_body_size).min(body.len());
-            let chunk = body.slice(offset..end);
+            frames.push(Frame::Body(self.id, body.slice(offset..end)));
             offset = end;
-            if offset == body.len() {
-                // Last chunk — carry the permit.
-                self.send_body_with_optional_permit(
-                    Frame::Body(self.id, chunk),
-                    held_permit.take(),
-                )?;
-            } else {
-                self.send_frame(Frame::Body(self.id, chunk))?;
-            }
         }
-        Ok(())
+        frames
     }
 
-    fn send_body_with_optional_permit(
+    /// Queues a publish's frames as one item, so no other frame on the
+    /// connection gets between them. The writer releases `permit` once they
+    /// are all written.
+    fn send_content(
         &self,
-        frame: Frame,
+        frames: Vec<Frame>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), Error> {
         self.check_open()?;
-        let item = match permit {
-            Some(p) => OutgoingFrame::FrameWithPermit(frame, p),
-            None => OutgoingFrame::Frame(frame),
-        };
-        self.shared.send(item)
+        self.shared.send(OutgoingFrame::Publish(frames, permit))
     }
 
     /// Send an RPC request and await its reply, with cancellation safety.
@@ -2048,5 +2002,182 @@ mod tests {
         assert_eq!(sem.available_permits(), 0);
         drop(permit);
         assert_eq!(sem.available_permits(), 100);
+    }
+
+    /// A channel whose outgoing frames land in the returned queue.
+    fn channel_with_frame_queue(
+        frame_max: u32,
+    ) -> (Arc<Channel>, mpsc::UnboundedReceiver<OutgoingFrame>) {
+        let (channel, frame_rx, incoming_tx) = channel_with_queues(frame_max);
+        // The dispatch task ends, and the channel closes, when this sender
+        // drops: leak it.
+        std::mem::forget(incoming_tx);
+        (channel, frame_rx)
+    }
+
+    /// A channel whose outgoing frames land in the returned queue, and whose
+    /// dispatch task handles the frames sent on the returned sender.
+    fn channel_with_queues(
+        frame_max: u32,
+    ) -> (
+        Arc<Channel>,
+        mpsc::UnboundedReceiver<OutgoingFrame>,
+        mpsc::UnboundedSender<Frame>,
+    ) {
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(ConnectionShared {
+            frame_tx,
+            publish_admission: Arc::new(tokio::sync::Semaphore::new(1 << 20)),
+            publish_admission_capacity: 1 << 20,
+            id_alloc: Mutex::new(crate::client::connection::ChannelIdAllocator::new(8)),
+            dead: tokio::sync::Notify::new(),
+            lost: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let channel = Channel::new(
+            1,
+            shared,
+            frame_max,
+            std::time::Duration::from_secs(5),
+            Arc::new(Mutex::new(HashMap::new())),
+            incoming_rx,
+        );
+        (Arc::new(channel), frame_rx, incoming_tx)
+    }
+
+    fn enable_confirms(channel: &Channel) {
+        let mut state = channel.confirms_state.lock().unwrap();
+        state.enabled = true;
+        state.next_seq = 1;
+    }
+
+    /// Every frame queued so far, in order.
+    fn queued_frames(rx: &mut mpsc::UnboundedReceiver<OutgoingFrame>) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            match item {
+                OutgoingFrame::Frame(f) => frames.push(f),
+                OutgoingFrame::Publish(fs, _) => frames.extend(fs),
+                OutgoingFrame::Shutdown => {}
+            }
+        }
+        frames
+    }
+
+    /// The message ids of the queued publishes, in order. Panics unless each
+    /// publish's header and bodies directly follow its method.
+    fn queued_publishes(rx: &mut mpsc::UnboundedReceiver<OutgoingFrame>) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut frames = queued_frames(rx).into_iter();
+        while let Some(frame) = frames.next() {
+            let Frame::Method(_, MethodFrame::BasicPublish(_)) = frame else {
+                continue;
+            };
+            let Some(Frame::Header(_, header)) = frames.next() else {
+                panic!("a publish's method must be followed by its header");
+            };
+            let mut remaining = header.body_size;
+            while remaining > 0 {
+                let Some(Frame::Body(_, body)) = frames.next() else {
+                    panic!("a publish's header must be followed by its bodies");
+                };
+                remaining -= body.len() as u64;
+            }
+            ids.push(header.properties.message_id.unwrap().to_string());
+        }
+        ids
+    }
+
+    fn with_message_id(id: String) -> BasicProperties {
+        BasicProperties {
+            message_id: Some(ShortStr::try_from(id).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_publishes_do_not_interleave_their_frames() {
+        // A body of several frames, so each publish is many queue sends.
+        let (channel, mut rx) = channel_with_frame_queue(64);
+        let tasks: Vec<_> = (0..8)
+            .map(|t| {
+                let channel = channel.clone();
+                tokio::spawn(async move {
+                    for i in 0..200 {
+                        channel
+                            .basic_publish(
+                                "",
+                                "q",
+                                vec![0u8; 512],
+                                with_message_id(format!("{t}-{i}")),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(queued_publishes(&mut rx).len(), 8 * 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn confirmed_publishes_are_queued_in_tag_order() {
+        let (channel, mut rx) = channel_with_frame_queue(64);
+        enable_confirms(&channel);
+        let tasks: Vec<_> = (0..8)
+            .map(|t| {
+                let channel = channel.clone();
+                tokio::spawn(async move {
+                    let mut tags = Vec::new();
+                    for i in 0..200 {
+                        let id = format!("{t}-{i}");
+                        let confirm = channel
+                            .basic_publish_confirmed(
+                                "",
+                                "q",
+                                vec![0u8; 512],
+                                with_message_id(id.clone()),
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                        tags.push((id, confirm.delivery_tag()));
+                    }
+                    tags
+                })
+            })
+            .collect();
+        let mut tag_of = HashMap::new();
+        for task in tasks {
+            tag_of.extend(task.await.unwrap());
+        }
+        let queued: Vec<u64> = queued_publishes(&mut rx)
+            .iter()
+            .map(|id| tag_of[id])
+            .collect();
+        assert_eq!(queued.len(), 8 * 200);
+        let out_of_order = (1..).zip(&queued).find(|(n, tag)| n != *tag);
+        assert_eq!(
+            out_of_order, None,
+            "(position, tag) of the first publish out of order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_publish_on_a_confirm_channel_takes_a_tag() {
+        let (channel, _rx) = channel_with_frame_queue(4096);
+        enable_confirms(&channel);
+        channel
+            .basic_publish("", "q", "plain", BasicProperties::default())
+            .await
+            .unwrap();
+        let confirm = channel
+            .basic_publish_confirmed("", "q", "confirmed", BasicProperties::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(confirm.delivery_tag(), 2);
     }
 }
