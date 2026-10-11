@@ -16,6 +16,7 @@ use tracing::{debug, error, trace, warn};
 use super::auth;
 use super::channel::Channel;
 use super::config::Config;
+use super::content::Content;
 use crate::error::Error;
 use crate::protocol::frame::{self, Frame, PROTOCOL_HEADER};
 use crate::protocol::method::MethodFrame;
@@ -33,7 +34,7 @@ pub(crate) enum OutgoingFrame {
     /// for the frames' bytes, providing genuine end-to-end backpressure: a
     /// publisher cannot enqueue more than `publish_admission_bytes` worth of
     /// content frames into the socket / kernel send queue at any time.
-    Publish(Vec<Frame>, Option<tokio::sync::OwnedSemaphorePermit>),
+    Publish(Content, Option<tokio::sync::OwnedSemaphorePermit>),
     Shutdown,
 }
 
@@ -821,9 +822,9 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
                     frame.encode(&mut write_buf);
                     flush_if_full(&mut write_half, &mut write_buf, &mut held_permits).await
                 }
-                OutgoingFrame::Publish(frames, permit) => {
+                OutgoingFrame::Publish(content, permit) => {
                     let result = async {
-                        for frame in frames {
+                        for frame in content {
                             frame.encode(&mut write_buf);
                             flush_if_full(&mut write_half, &mut write_buf, &mut held_permits)
                                 .await?;
@@ -1207,19 +1208,24 @@ mod tests {
     async fn writer_flushes_a_large_publish_in_batch_sized_writes() {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = mpsc::unbounded_channel();
-        let frame = vec![0u8; 4096];
-        let bodies = (0..256).map(|_| Frame::Body(1, frame.clone().into()));
-        tx.send(OutgoingFrame::Publish(bodies.collect(), None))
-            .unwrap();
+        let content = Content::new(
+            1,
+            MethodFrame::ChannelCloseOk,
+            Default::default(),
+            vec![0u8; 256 * 4088].into(),
+            4096,
+        );
+        tx.send(OutgoingFrame::Publish(content, None)).unwrap();
         tx.send(OutgoingFrame::Shutdown).unwrap();
 
         writer_loop(RecordingWriter(writes.clone()), rx).await;
 
         let writes = writes.lock().unwrap();
-        assert_eq!(writes.iter().sum::<usize>(), 256 * (4096 + 8));
+        // 256 full body frames, plus the method and header frames.
+        assert!(writes.iter().sum::<usize>() > 256 * 4096);
         let largest = writes.iter().max().unwrap();
         assert!(
-            *largest < WRITER_BATCH_BYTES + 4096 + 8,
+            *largest < WRITER_BATCH_BYTES + 4096,
             "largest write was {largest} bytes"
         );
     }

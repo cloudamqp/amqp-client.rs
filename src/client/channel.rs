@@ -61,6 +61,7 @@ use tracing::{debug, trace, warn};
 
 use super::connection::{ConnectionShared, OutgoingFrame};
 use super::consumer::Consumer;
+use super::content::Content;
 use super::exchange::Exchange;
 use super::message::{DeliverMessage, GetMessage, MessageHandle};
 use super::queue::Queue;
@@ -647,10 +648,10 @@ impl Channel {
         });
 
         let body_len = body.len();
-        let frames = self.content_frames(method, props, body);
+        let content = Content::new(self.id, method, props, body, self.frame_max);
         {
             let mut confirms = self.confirms_state.lock().unwrap();
-            self.send_content(frames, permit)?;
+            self.send_content(content, permit)?;
             // In confirm mode the broker numbers this publish too.
             if confirms.enabled {
                 confirms.next_seq += 1;
@@ -862,7 +863,7 @@ impl Channel {
             immediate: false,
         });
 
-        let frames = self.content_frames(method, props, body);
+        let content = Content::new(self.id, method, props, body, self.frame_max);
         let (delivery_tag, rx) = {
             let mut state = self.confirms_state.lock().unwrap();
             if !state.enabled {
@@ -871,7 +872,7 @@ impl Channel {
             // Queued under the lock, so the broker numbers publishes in the
             // order their tags were taken. Sending never awaits. Registered
             // after: the dispatch task takes this lock to resolve the confirm.
-            self.send_content(frames, permit)?;
+            self.send_content(content, permit)?;
             let delivery_tag = state.next_seq;
             state.next_seq += 1;
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1010,47 +1011,16 @@ impl Channel {
         Ok(Some(permit))
     }
 
-    /// A publish's frames: method, header, then the body split to fit
-    /// `frame_max`.
-    fn content_frames(
-        &self,
-        method: MethodFrame,
-        props: BasicProperties,
-        body: Bytes,
-    ) -> Vec<Frame> {
-        let header = Frame::Header(
-            self.id,
-            Box::new(ContentHeader {
-                class_id: 60,
-                body_size: body.len() as u64,
-                properties: props,
-            }),
-        );
-        let mut frames = vec![Frame::Method(self.id, method), header];
-        let max_body_size = if self.frame_max > 0 {
-            (self.frame_max as usize).saturating_sub(8)
-        } else {
-            body.len()
-        };
-        let mut offset = 0;
-        while offset < body.len() {
-            let end = (offset + max_body_size).min(body.len());
-            frames.push(Frame::Body(self.id, body.slice(offset..end)));
-            offset = end;
-        }
-        frames
-    }
-
-    /// Queues a publish's frames as one item, so no other frame on the
-    /// connection gets between them. The writer releases `permit` once they
-    /// are all written.
+    /// Queues a publish as one item, so no other frame on the connection
+    /// gets between its frames. The writer releases `permit` once they are
+    /// all written.
     fn send_content(
         &self,
-        frames: Vec<Frame>,
+        content: Content,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), Error> {
         self.check_open()?;
-        self.shared.send(OutgoingFrame::Publish(frames, permit))
+        self.shared.send(OutgoingFrame::Publish(content, permit))
     }
 
     /// Send an RPC request and await its reply, with cancellation safety.
@@ -2062,7 +2032,7 @@ mod tests {
         while let Ok(item) = rx.try_recv() {
             match item {
                 OutgoingFrame::Frame(f) => frames.push(f),
-                OutgoingFrame::Publish(fs, _) => frames.extend(fs),
+                OutgoingFrame::Publish(content, _) => frames.extend(content),
                 OutgoingFrame::Shutdown => {}
             }
         }
