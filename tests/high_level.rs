@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use amqp_client_rs::{
-    BasicProperties, Client, Codec, Connection, Error, ExchangeDeclareOpts, ExchangeKind,
-    QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
+    BasicProperties, Client, Codec, Connection, DecodeFailure, Error, ExchangeDeclareOpts,
+    ExchangeKind, MessageMeta, QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts,
+    TypedConsumer, TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,11 +20,19 @@ impl Codec for JsonCodec {
         "application/json"
     }
 
-    fn encode<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>, Error> {
+    fn encode<T: serde::Serialize>(
+        &self,
+        value: &T,
+        _props: &mut BasicProperties,
+    ) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
     }
 
-    fn decode<T: serde::de::DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Error> {
+    fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        bytes: &[u8],
+        _meta: &MessageMeta<'_>,
+    ) -> Result<T, Error> {
         serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
     }
 }
@@ -67,6 +76,7 @@ async fn next_within<T: serde::de::DeserializeOwned + 'static>(
         .await
         .ok()
         .flatten()
+        .map(|r| r.expect("delivery failed to decode"))
 }
 
 fn greeting(value: u32) -> Greeting {
@@ -127,6 +137,226 @@ async fn client_publish_with_props() {
     let corr = delivery.properties.correlation_id.as_ref().unwrap();
     assert_eq!(corr.as_str().unwrap(), "corr-abc-123");
     delivery.ack().unwrap();
+}
+
+#[allow(clippy::result_large_err)]
+async fn next_raw<T: serde::de::DeserializeOwned + 'static, C: Codec>(
+    consumer: &mut TypedConsumer<T, C>,
+) -> Result<TypedDelivery<T>, DecodeFailure> {
+    tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .expect("no message")
+        .expect("consumer ended")
+}
+
+/// A body the codec cannot decode reaches the caller unsettled (ADR-0006): it
+/// is redelivered when nacked with requeue, and gone once rejected.
+#[tokio::test]
+async fn an_undecodable_delivery_is_left_to_the_caller() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"not json", BasicProperties::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(matches!(f.error, Error::Codec(_)), "{:?}", f.error);
+    assert_eq!(f.body, b"not json");
+    assert!(!f.redelivered);
+    f.nack(true).unwrap();
+
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(f.redelivered);
+    f.reject(false).unwrap();
+
+    client.publish("", &q.name(), &greeting(1)).await.unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert_eq!(d.body, greeting(1), "the rejected delivery came back");
+    d.ack().unwrap();
+}
+
+/// Settling a delivery from a `no_ack` consumer fails locally and leaves the
+/// consumer running.
+#[tokio::test]
+async fn settling_a_no_ack_delivery_keeps_the_consumer() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts {
+            no_ack: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    client.publish("", &q.name(), &greeting(1)).await.unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert!(matches!(d.ack(), Err(Error::NoAck)));
+
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert_eq!(d.body, greeting(2));
+}
+
+/// JSON that sets `type` on encode and decodes only messages of that type.
+struct TypedJsonCodec;
+
+impl Codec for TypedJsonCodec {
+    fn content_type(&self) -> &str {
+        "application/json"
+    }
+
+    fn encode<T: serde::Serialize + 'static>(
+        &self,
+        value: &T,
+        props: &mut BasicProperties,
+    ) -> Result<Vec<u8>, Error> {
+        props.type_field = Some("greeting".try_into().unwrap());
+        JsonCodec.encode(value, props)
+    }
+
+    fn decode<T: serde::de::DeserializeOwned + 'static>(
+        &self,
+        bytes: &[u8],
+        meta: &MessageMeta<'_>,
+    ) -> Result<T, Error> {
+        match meta.properties.type_field.as_ref().map(|t| t.as_str()) {
+            Some(Ok("greeting")) => JsonCodec.decode(bytes, meta),
+            other => Err(Error::Codec(format!("unknown type {other:?}"))),
+        }
+    }
+}
+
+/// What the codec sets on publish reaches the consumer's codec (ADR-0004).
+#[tokio::test]
+async fn the_codec_sets_and_reads_message_properties() {
+    let client = Client::builder(AMQP_URI)
+        .unwrap()
+        .codec(TypedJsonCodec)
+        .build()
+        .await
+        .unwrap();
+    let q = client.queue("", exclusive()).await.unwrap();
+    client.publish("", &q.name(), &greeting(7)).await.unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"{}", BasicProperties::default())
+        .await
+        .unwrap();
+
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    let d = next_raw(&mut consumer).await.unwrap();
+    assert_eq!(d.body, greeting(7));
+    d.ack().unwrap();
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(matches!(f.error, Error::Codec(_)), "{:?}", f.error);
+    f.reject(false).unwrap();
+}
+
+/// By default a compressed delivery is a decode failure carrying the
+/// compressed body (ADR-0005).
+#[tokio::test]
+async fn identity_returns_compressed_deliveries_as_failures() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let props = BasicProperties::builder()
+        .content_encoding("gzip")
+        .build()
+        .unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"\x1f\x8b...", props)
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    let f = next_raw(&mut consumer).await.unwrap_err();
+    assert!(
+        matches!(f.error, Error::ContentEncoding(_)),
+        "{:?}",
+        f.error
+    );
+    assert_eq!(f.body, b"\x1f\x8b...");
+    f.reject(false).unwrap();
+}
+
+#[cfg(feature = "compression")]
+async fn gzip_client() -> Client {
+    Client::builder(AMQP_URI)
+        .unwrap()
+        .encoding(amqp_client_rs::Compression::gzip())
+        .build()
+        .await
+        .unwrap()
+}
+
+/// With `Compression`, bodies go out gzipped and come back decoded.
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compression_publishes_gzip_and_decodes_it() {
+    let client = gzip_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .publish("", &q.name(), &b"hello".to_vec())
+        .await
+        .unwrap();
+
+    let raw = client
+        .channel()
+        .basic_get(&q.name(), true)
+        .await
+        .unwrap()
+        .expect("no message");
+    let encoding = raw.properties.content_encoding.as_ref().unwrap();
+    assert_eq!(encoding.as_str().unwrap(), "gzip");
+    assert_eq!(&raw.body[..2], b"\x1f\x8b", "body is not gzip");
+
+    client
+        .publish("", &q.name(), &b"hello".to_vec())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.body, b"hello");
+    d.ack().unwrap();
+}
+
+/// A publish whose properties name another encoding fails before sending.
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compression_refuses_to_publish_under_another_encoding() {
+    let client = gzip_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let props = BasicProperties::builder()
+        .content_encoding("deflate")
+        .build()
+        .unwrap();
+    let result = client
+        .publish_with_props("", &q.name(), &b"hello".to_vec(), props)
+        .await;
+    assert!(
+        matches!(result, Err(Error::ContentEncoding(_))),
+        "{result:?}"
+    );
+    assert!(!has_message(&client, &q.name()).await, "it was sent");
 }
 
 /// With prefetch 1, the second message arrives only after the first is acked.
@@ -822,4 +1052,99 @@ async fn deleting_an_already_deleted_queue_succeeds() {
     let subscribed = q.subscribe::<Greeting>(SubscribeOpts::default()).await;
     assert!(matches!(subscribed, Err(Error::QueueDeleted { .. })));
     assert!(!queue_exists(&name).await);
+}
+
+// ---------------------------------------------------------------------------
+// TypedConsumer as a Stream
+// ---------------------------------------------------------------------------
+
+async fn stream_next<S: futures_util::Stream + Unpin>(stream: &mut S) -> Option<S::Item> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(Duration::from_secs(5), StreamExt::next(stream))
+        .await
+        .expect("stream yielded nothing")
+}
+
+/// A consumer is a `Stream` of deliveries, in order.
+#[tokio::test]
+async fn the_consumer_is_a_stream() {
+    use futures_util::StreamExt;
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    for n in 1..=3 {
+        client.publish("", &q.name(), &greeting(n)).await.unwrap();
+    }
+    let consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let bodies: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        consumer
+            .take(3)
+            .map(|r| {
+                let d = r.unwrap();
+                d.ack().unwrap();
+                d.body.value
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bodies, [1, 2, 3]);
+}
+
+/// The stream yields decode failures as items and carries on after them.
+#[tokio::test]
+async fn the_stream_yields_decode_failures() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    client
+        .channel()
+        .basic_publish("", &q.name(), b"not json", BasicProperties::default())
+        .await
+        .unwrap();
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+
+    let f = stream_next(&mut consumer).await.unwrap().unwrap_err();
+    assert!(matches!(f.error, Error::Codec(_)), "{:?}", f.error);
+    f.reject(false).unwrap();
+    let d = stream_next(&mut consumer).await.unwrap().unwrap();
+    assert_eq!(d.body, greeting(2));
+    d.ack().unwrap();
+}
+
+/// The stream ends when its queue is deleted.
+#[tokio::test]
+async fn the_stream_ends_when_the_queue_is_deleted() {
+    let client = json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    q.delete(QueueDeleteOpts::default()).await.unwrap();
+    assert!(stream_next(&mut consumer).await.is_none());
+}
+
+/// With recovery, the stream carries on after its channel is closed.
+#[tokio::test]
+async fn the_stream_recovers_after_channel_closed() {
+    let client = recovering_json_client().await;
+    let q = client.queue("", exclusive()).await.unwrap();
+    let mut consumer = q
+        .subscribe::<Greeting>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    close_consumer_channel(&client, &q.name(), &mut consumer).await;
+
+    client.publish("", &q.name(), &greeting(2)).await.unwrap();
+    let d = stream_next(&mut consumer).await.unwrap().unwrap();
+    assert_eq!(d.body, greeting(2));
+    d.ack().unwrap();
 }

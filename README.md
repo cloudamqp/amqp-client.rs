@@ -98,12 +98,50 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
         .subscribe::<String>(SubscribeOpts { prefetch: 50, ..Default::default() })
         .await?;
     while let Some(delivery) = consumer.next().await {
-        println!("Received: {}", delivery.body);
-        delivery.ack()?;
+        match delivery {
+            Ok(d) => {
+                println!("Received: {}", d.body);
+                d.ack()?;
+            }
+            Err(f) => {
+                println!("Undecodable: {}", f.error);
+                f.reject(false)?;
+            }
+        }
     }
     Ok(())
 }
 ```
+
+A delivery that fails to decode arrives as a `DecodeFailure` with the raw
+body. The client does not settle it: ack, reject or requeue it yourself
+([ADR-0006](docs/adr/0006-consumer-returns-decode-failures.md)).
+
+`TypedConsumer` is also a `futures::Stream` of the same items, so stream
+combinators work on it:
+
+```rust
+use futures::StreamExt;
+
+consumer
+    .for_each_concurrent(10, |r| async move {
+        match r {
+            Ok(d) => { handle(&d.body).await; let _ = d.ack(); }
+            Err(f) => { let _ = f.reject(false); }
+        }
+    })
+    .await;
+```
+
+The codec sees each message's properties, exchange and routing key, so it can
+pick the type to decode by e.g. the `type` property, and set it on publish
+([ADR-0004](docs/adr/0004-codec-decode-sees-message-metadata.md)).
+
+`content_encoding` is handled by the client, not the codec
+([ADR-0005](docs/adr/0005-content-encoding-is-a-client-layer.md)). By default
+a compressed delivery is a `DecodeFailure`. With the `compression` feature,
+`.encoding(Compression::gzip())` on the builder decodes `gzip` and `deflate`
+deliveries and publishes gzip.
 
 The client records the exchanges, queues and bindings declared through it.
 With `.recovery(RecoveryConfig::default())` on the builder

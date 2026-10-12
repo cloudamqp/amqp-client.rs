@@ -44,6 +44,14 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
         // next() waits across recovery; it returns None once the client is
         // dropped.
         while let Some(delivery) = consumer.next().await {
+            let delivery = match delivery {
+                Ok(d) => d,
+                Err(f) => {
+                    println!("undecodable delivery: {}", f.error);
+                    let _ = f.reject(false);
+                    continue;
+                }
+            };
             let body = String::from_utf8_lossy(&delivery.body);
             println!("received {body} ({})", delivery.routing_key);
             // Fails if the channel or connection is gone; the broker then

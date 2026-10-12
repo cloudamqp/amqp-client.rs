@@ -41,9 +41,9 @@ amqp-client.rs uses config-wide `connect_timeout` / `rpc_timeout` (callers can w
 | Lifecycle hooks | None | `OnConnect`, `OnDisconnect`, `OnFailed`, `OnReturn` |
 | Publish | `publish` fire-and-forget; `publish_confirmed` waits for the confirm (ADR-0003); transient unless props say otherwise; retried once if never sent | Persistent and confirmed by default; pipelined confirms; retries transparently if channel closed before send |
 | Mandatory / returns | Only low level | `Message.Mandatory` + `OnReturn` |
-| Consume model | Pull: `TypedConsumer::next()`, caller acks; default prefetch 20 | Push: handler; acks on `nil`, requeues on error/panic; `Workers` for concurrency; default prefetch 20 |
-| Decode failure | Auto-nack (no requeue), skipped | Handler calls `d.Decode`, decides itself |
-| Codecs | One `Codec` per client, compile-time typed (serde); bring your own (only `ByteCodec` built in) | Registry by `content-type` + `content-encoding`; built-in JSON, text, gzip, deflate; dynamic (`any`) |
+| Consume model | Pull: `TypedConsumer::next()` or as a `Stream`, caller acks; default prefetch 20 | Push: handler; acks on `nil`, requeues on error/panic; `Workers` for concurrency; default prefetch 20 |
+| Decode failure | Returned as a `DecodeFailure` with the raw body; caller acks, rejects or requeues (ADR-0006) | Handler calls `d.Decode`, decides itself |
+| Codecs | One `Codec` per client, compile-time typed (serde), sees properties, exchange and routing key (ADR-0004); bring your own (only `ByteCodec` built in). `content-encoding` is a separate client layer; gzip and deflate with the `compression` feature (ADR-0005) | Registry by `content-type` + `content-encoding`; built-in JSON, text, gzip, deflate; dynamic (`any`) |
 | RPC | None | `RPCServer`, `RPCCall`, `RPCClient` over direct reply-to |
 | Basic get | Only low level | `Queue.Get` |
 | Escape hatch | `client.channel()` (session-bound) | `c.Connection(ctx)` |

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::codec::{ByteCodec, Codec};
+use super::encoding::{ContentEncoder, Identity};
 use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
 use super::recovery::RecoveryConfig;
@@ -31,6 +32,7 @@ use crate::protocol::types::ShortStr;
 /// Use [`Client::builder`] to create a new client.
 pub struct Client<C: Codec = ByteCodec> {
     codec: Arc<C>,
+    encoder: Arc<dyn ContentEncoder>,
     /// The only strong reference: dropping the `Client` closes the
     /// connection, ending every consumer.
     inner: Arc<ClientInner>,
@@ -47,6 +49,7 @@ impl Client<ByteCodec> {
         Ok(ClientBuilder {
             config,
             codec: Arc::new(ByteCodec),
+            encoder: Arc::new(Identity),
             recovery: None,
         })
     }
@@ -121,7 +124,12 @@ impl<C: Codec> Client<C> {
             .lock()
             .unwrap()
             .record_queue(name, &ok.queue, opts);
-        Ok(Queue::new(id, &self.inner, self.codec.clone()))
+        Ok(Queue::new(
+            id,
+            &self.inner,
+            self.codec.clone(),
+            self.encoder.clone(),
+        ))
     }
 
     /// Publish a serialized message to an exchange with the given routing key.
@@ -142,7 +150,8 @@ impl<C: Codec> Client<C> {
     /// Publish a serialized message with custom properties.
     ///
     /// If the provided properties do not already have a `content_type` set, the
-    /// codec's content type is used.
+    /// codec's content type is used. The codec's `encode` may add to or
+    /// overwrite them.
     pub async fn publish_with_props<T: serde::Serialize + 'static>(
         &self,
         exchange: &str,
@@ -193,7 +202,7 @@ impl<C: Codec> Client<C> {
             props.content_type =
                 Some(ShortStr::try_from(self.codec.content_type()).map_err(Error::Protocol)?);
         }
-        let encoded = self.codec.encode(body)?;
+        let encoded = self.encode(body, &mut props)?;
         // Errors here mean the message was not (fully) sent, so with_session
         // may send it again on a recovered session.
         let (channel, confirm) = self
@@ -218,14 +227,24 @@ impl<C: Codec> Client<C> {
         confirm_outcome(confirm, closed_by_broker)
     }
 
+    /// The wire body for `body`: the codec's, content-encoded (ADR-0005).
+    fn encode<T: serde::Serialize + 'static>(
+        &self,
+        body: &T,
+        props: &mut BasicProperties,
+    ) -> Result<Vec<u8>, Error> {
+        let encoded = self.codec.encode(body, props)?;
+        self.encoder.encode(encoded, props)
+    }
+
     async fn publish_inner<T: serde::Serialize + 'static>(
         &self,
         exchange: &str,
         routing_key: &str,
         body: &T,
-        props: BasicProperties,
+        mut props: BasicProperties,
     ) -> Result<(), Error> {
-        let encoded = self.codec.encode(body)?;
+        let encoded = self.encode(body, &mut props)?;
         self.inner
             .with_session(|s| {
                 let (encoded, props) = (encoded.clone(), props.clone());
@@ -278,6 +297,7 @@ fn confirm_outcome(
 pub struct ClientBuilder<C: Codec = ByteCodec> {
     config: Config,
     codec: Arc<C>,
+    encoder: Arc<dyn ContentEncoder>,
     recovery: Option<RecoveryConfig>,
 }
 
@@ -288,8 +308,17 @@ impl<C: Codec> ClientBuilder<C> {
         ClientBuilder {
             config: self.config,
             codec: Arc::new(codec),
+            encoder: self.encoder,
             recovery: self.recovery,
         }
+    }
+
+    /// Set the [`ContentEncoder`] that runs between the wire and the codec,
+    /// e.g. `Compression::gzip()` with the `compression` feature (ADR-0005).
+    /// Defaults to [`Identity`].
+    pub fn encoding<E: ContentEncoder>(mut self, encoder: E) -> Self {
+        self.encoder = Arc::new(encoder);
+        self
     }
 
     /// Turn on automatic recovery (ADR-0002). Without it, losing a channel or
@@ -311,6 +340,7 @@ impl<C: Codec> ClientBuilder<C> {
 
         Ok(Client {
             codec: self.codec,
+            encoder: self.encoder,
             inner,
         })
     }

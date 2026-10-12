@@ -141,25 +141,59 @@ impl std::fmt::Debug for GetMessage {
     }
 }
 
+/// A handle on channel 7 of a connection that is not there; the frames it
+/// sends arrive on the receiver.
+#[cfg(test)]
+pub(crate) fn test_handle() -> (
+    MessageHandle,
+    tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
+) {
+    use crate::client::connection::ChannelIdAllocator;
+    let (frame_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(ConnectionShared {
+        frame_tx,
+        publish_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+        publish_admission_capacity: 1,
+        id_alloc: std::sync::Mutex::new(ChannelIdAllocator::new(1)),
+        dead: tokio::sync::Notify::new(),
+        lost: std::sync::atomic::AtomicBool::new(false),
+    });
+    (MessageHandle::new(7, shared, ClosedState::default()), rx)
+}
+
+/// A delivery with delivery tag 42 on [`test_handle`]'s channel.
+#[cfg(test)]
+pub(crate) fn test_delivery(
+    body: &[u8],
+    properties: BasicProperties,
+) -> (
+    DeliverMessage,
+    tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
+) {
+    let (handle, rx) = test_handle();
+    let msg = DeliverMessage {
+        consumer_tag: ShortStr::try_from("ctag").unwrap(),
+        delivery_tag: 42,
+        redelivered: false,
+        exchange: ShortStr::try_from("amq.topic").unwrap(),
+        routing_key: ShortStr::try_from("rmq.queues.host").unwrap(),
+        properties,
+        body: Bytes::copy_from_slice(body),
+        handle,
+    };
+    (msg, rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::channel::ChannelClose;
-    use crate::client::connection::ChannelIdAllocator;
-    use std::sync::Mutex;
-    use tokio::sync::{Semaphore, mpsc};
 
-    fn handle() -> (MessageHandle, mpsc::UnboundedReceiver<OutgoingFrame>) {
-        let (frame_tx, rx) = mpsc::unbounded_channel();
-        let shared = Arc::new(ConnectionShared {
-            frame_tx,
-            publish_admission: Arc::new(Semaphore::new(1)),
-            publish_admission_capacity: 1,
-            id_alloc: Mutex::new(ChannelIdAllocator::new(1)),
-            dead: tokio::sync::Notify::new(),
-            lost: std::sync::atomic::AtomicBool::new(false),
-        });
-        (MessageHandle::new(7, shared, ClosedState::default()), rx)
+    fn handle() -> (
+        MessageHandle,
+        tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
+    ) {
+        test_handle()
     }
 
     #[test]

@@ -6,8 +6,8 @@ mod support;
 use std::time::{Duration, Instant};
 
 use amqp_client_rs::{
-    Client, Connection, Error, ExchangeDeclareOpts, QueueDeclareOpts, QueueDeleteOpts,
-    RecoveryConfig, SubscribeOpts,
+    Client, Connection, Error, ExchangeDeclareOpts, QueueDeclareOk, QueueDeclareOpts,
+    QueueDeleteOpts, RecoveryConfig, SubscribeOpts,
 };
 use support::proxy::Proxy;
 
@@ -26,18 +26,25 @@ async fn recovering_client(proxy: &Proxy) -> Client {
         .unwrap()
 }
 
-/// Message count of `queue`, seen over a direct (unproxied) connection.
-async fn depth(queue: &str) -> u32 {
+/// `queue` as seen over a direct (unproxied) connection.
+async fn declare_passive(queue: &str) -> QueueDeclareOk {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
     let passive = QueueDeclareOpts {
         passive: true,
         ..Default::default()
     };
-    ch.queue_declare(queue, passive)
-        .await
-        .unwrap()
-        .message_count
+    ch.queue_declare(queue, passive).await.unwrap()
+}
+
+/// Message count of `queue`.
+async fn depth(queue: &str) -> u32 {
+    declare_passive(queue).await.message_count
+}
+
+/// Consumer count of `queue`.
+async fn consumers(queue: &str) -> u32 {
+    declare_passive(queue).await.consumer_count
 }
 
 async fn delete_queue(queue: &str) {
@@ -179,7 +186,8 @@ async fn consumer_survives_connection_loss() {
     let mut received = false;
     for _ in 0..50 {
         let _ = client.publish("", &queue, &vec![7u8]).await;
-        if let Ok(Some(d)) = tokio::time::timeout(Duration::from_millis(100), consumer.next()).await
+        if let Ok(Some(Ok(d))) =
+            tokio::time::timeout(Duration::from_millis(100), consumer.next()).await
         {
             assert_eq!(d.body, vec![7u8]);
             d.ack().unwrap();
@@ -452,4 +460,93 @@ async fn a_zero_timeout_does_not_spin() {
     let attempts = proxy.accepted();
     assert!(attempts <= 15, "{attempts} connect attempts in 1 s");
     next.abort();
+}
+
+/// A consumer that stops being polled mid-recovery must not keep holding its
+/// queue's lock: a delete still completes.
+#[tokio::test]
+async fn an_unpolled_recovering_consumer_does_not_block_a_delete() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    let queue = name("unpolled");
+    let q = client
+        .queue(&queue, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    // Acking twice makes the broker close the consumer's channel.
+    client.publish("", &queue, &vec![1u8]).await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    d.ack().unwrap();
+    d.ack().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Recovery starts, takes the queue's lock and hangs on its redeclare.
+    proxy.freeze();
+    let polled = tokio::time::timeout(Duration::from_millis(300), consumer.next()).await;
+    assert!(polled.is_err(), "recovery did not hang: {polled:?}");
+    proxy.unfreeze();
+
+    let deleted =
+        tokio::time::timeout(Duration::from_secs(2), q.delete(QueueDeleteOpts::default())).await;
+    assert!(matches!(deleted, Ok(Ok(_))), "delete blocked: {deleted:?}");
+    let ended = tokio::time::timeout(Duration::from_secs(2), consumer.next()).await;
+    assert!(matches!(ended, Ok(None)), "consumer did not end");
+}
+
+/// Recovery is a task of its own: it finishes while the consumer is not
+/// polled, and the next poll resumes on the recovered consumer.
+#[tokio::test]
+async fn a_consumer_recovers_while_not_polled() {
+    let proxy = Proxy::start().await;
+    let client = recovering_client(&proxy).await;
+    let queue = name("unpolled-recovers");
+    let q = client
+        .queue(&queue, QueueDeclareOpts::default())
+        .await
+        .unwrap();
+    let mut consumer = q
+        .subscribe::<Vec<u8>>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    // Acking twice makes the broker close the consumer's channel.
+    client.publish("", &queue, &vec![1u8]).await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    d.ack().unwrap();
+    d.ack().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The poll starts recovery, which hangs on the frozen proxy.
+    proxy.freeze();
+    let polled = tokio::time::timeout(Duration::from_millis(300), consumer.next()).await;
+    assert!(polled.is_err(), "recovery did not hang: {polled:?}");
+    proxy.unfreeze();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while consumers(&queue).await == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "not consuming again while not polled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client.publish("", &queue, &vec![2u8]).await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(2), consumer.next())
+        .await
+        .expect("no delivery after recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.body, vec![2u8]);
+    delete_queue(&queue).await;
 }

@@ -36,6 +36,11 @@ pub enum Error {
     #[error("Codec error: {0}")]
     Codec(String),
 
+    /// A body could not be content-encoded or decoded (ADR-0005), e.g. an
+    /// unsupported `content_encoding` or corrupt compressed data.
+    #[error("Content encoding error: {0}")]
+    ContentEncoding(String),
+
     #[error("Channel.Flow has held publishes suspended longer than allowed")]
     FlowSuspendedTooLong,
 
@@ -60,6 +65,11 @@ pub enum Error {
     /// the broker.
     #[error("queue {name} was deleted")]
     QueueDeleted { name: String },
+
+    /// A delivery from a `no_ack` consumer was acked, nacked or rejected.
+    /// Nothing was sent: the broker would close the channel.
+    #[error("the delivery came from a no_ack consumer and cannot be settled")]
+    NoAck,
 }
 
 #[derive(Debug)]
