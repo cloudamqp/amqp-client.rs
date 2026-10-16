@@ -4,6 +4,10 @@ status: accepted
 
 # Codec sees message metadata
 
+The trait signature below is superseded by ADR-0007, which splits it into
+`Codec`, `Encode<T>` and `Decode<T>`; the metadata each direction sees is
+unchanged.
+
 `Codec` only turns payload bytes into values and back. Both directions see
 the message's metadata:
 

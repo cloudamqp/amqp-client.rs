@@ -1,4 +1,4 @@
-use std::any::{Any, TypeId};
+use bytes::Bytes;
 
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
@@ -11,76 +11,104 @@ pub struct MessageMeta<'a> {
     pub routing_key: &'a str,
 }
 
-/// Encodes typed values to wire bytes and back.
+/// Turns typed values into wire bytes and back, for the types it implements
+/// [`Encode`] and [`Decode`] for (ADR-0007). Publishing or subscribing with
+/// any other type does not compile.
 ///
 /// Both directions see the message's metadata, so a codec can pick the type
 /// to decode by e.g. the routing key or the `type` property, and set that
 /// property when encoding (ADR-0004). Bodies are uncompressed: a codec must
 /// not read or set `content_encoding`.
-///
-/// The `+ 'static` bound on `T` lets implementations inspect the concrete
-/// type at runtime (used by [`ByteCodec`]) and is satisfied by every owned
-/// type and `'static` borrow that derives `Serialize`/`Deserialize`.
 pub trait Codec: Send + Sync + 'static {
     fn content_type(&self) -> &str;
-    /// Encode `value`, adding to or overwriting the outgoing `props`.
-    fn encode<T: serde::Serialize + 'static>(
-        &self,
-        value: &T,
-        props: &mut BasicProperties,
-    ) -> Result<Vec<u8>, Error>;
-    fn decode<T: serde::de::DeserializeOwned + 'static>(
-        &self,
-        bytes: &[u8],
-        meta: &MessageMeta<'_>,
-    ) -> Result<T, Error>;
 }
 
-/// Pass-through codec for raw bytes.
+/// A [`Codec`] that can encode a `T`.
+pub trait Encode<T: ?Sized>: Codec {
+    /// Encode `value`, adding to or overwriting the outgoing `props`.
+    fn encode(&self, value: &T, props: &mut BasicProperties) -> Result<Vec<u8>, Error>;
+}
+
+/// A [`Codec`] that can decode a `T`.
+pub trait Decode<T>: Codec {
+    fn decode(&self, bytes: &[u8], meta: &MessageMeta<'_>) -> Result<T, Error>;
+}
+
+/// Pass-through codec for raw bytes and UTF-8 text.
 ///
 /// This is the default codec used by [`Client`](super::client::Client) when
 /// the caller doesn't provide one via
-/// [`ClientBuilder::codec`](super::client::ClientBuilder::codec). It accepts
-/// only `Vec<u8>` — any other type returns
-/// [`Error::Codec`]. Sets `content_type` to `application/octet-stream`.
+/// [`ClientBuilder::codec`](super::client::ClientBuilder::codec). It encodes
+/// `str`, `String`, `[u8]`, `[u8; N]`, `Vec<u8>` and [`Bytes`], and decodes
+/// into `Vec<u8>`, [`Bytes`] and `String`; a body that is not UTF-8 does not
+/// decode into a `String`. Sets `content_type` to `application/octet-stream`.
+///
+/// Other types do not compile:
+///
+/// ```compile_fail
+/// # use amqp_client_rs::{BasicProperties, ByteCodec, Encode};
+/// ByteCodec.encode(&42u32, &mut BasicProperties::default());
+/// ```
+///
+/// ```compile_fail
+/// # use amqp_client_rs::{ByteCodec, Decode, MessageMeta};
+/// # fn f(meta: &MessageMeta<'_>) {
+/// let n: Result<u32, _> = ByteCodec.decode(b"42", meta);
+/// # }
+/// ```
 pub struct ByteCodec;
 
 impl Codec for ByteCodec {
     fn content_type(&self) -> &str {
         "application/octet-stream"
     }
+}
 
-    fn encode<T: serde::Serialize + 'static>(
-        &self,
-        value: &T,
-        _props: &mut BasicProperties,
-    ) -> Result<Vec<u8>, Error> {
-        let any: &dyn Any = value;
-        if let Some(v) = any.downcast_ref::<Vec<u8>>() {
-            return Ok(v.clone());
-        }
-        Err(Error::Codec(format!(
-            "ByteCodec only supports Vec<u8>, got {}",
-            std::any::type_name::<T>()
-        )))
+impl Encode<[u8]> for ByteCodec {
+    fn encode(&self, value: &[u8], _props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
+        Ok(value.to_vec())
     }
+}
 
-    fn decode<T: serde::de::DeserializeOwned + 'static>(
-        &self,
-        bytes: &[u8],
-        _meta: &MessageMeta<'_>,
-    ) -> Result<T, Error> {
-        if TypeId::of::<T>() == TypeId::of::<Vec<u8>>() {
-            let boxed: Box<dyn Any> = Box::new(bytes.to_vec());
-            return boxed
-                .downcast::<T>()
-                .map(|b| *b)
-                .map_err(|_| Error::Codec("internal: failed to downcast to Vec<u8>".into()));
+/// Implements `Encode<$t>` for a type that derefs to `[u8]` via `$bytes`.
+macro_rules! encode_as_bytes {
+    ($($t:ty => $bytes:expr),* $(,)?) => {$(
+        impl Encode<$t> for ByteCodec {
+            fn encode(&self, value: &$t, props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
+                Encode::<[u8]>::encode(self, $bytes(value), props)
+            }
         }
-        Err(Error::Codec(format!(
-            "ByteCodec only supports Vec<u8>, got {}",
-            std::any::type_name::<T>()
-        )))
+    )*};
+}
+
+encode_as_bytes! {
+    str => str::as_bytes,
+    String => String::as_bytes,
+    Vec<u8> => Vec::as_slice,
+    Bytes => Bytes::as_ref,
+}
+
+impl<const N: usize> Encode<[u8; N]> for ByteCodec {
+    fn encode(&self, value: &[u8; N], props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
+        Encode::<[u8]>::encode(self, value, props)
+    }
+}
+
+impl Decode<Vec<u8>> for ByteCodec {
+    fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<Vec<u8>, Error> {
+        Ok(bytes.to_vec())
+    }
+}
+
+impl Decode<Bytes> for ByteCodec {
+    fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<Bytes, Error> {
+        Ok(Bytes::copy_from_slice(bytes))
+    }
+}
+
+impl Decode<String> for ByteCodec {
+    fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<String, Error> {
+        String::from_utf8(bytes.to_vec()).map_err(|e| Error::Codec(e.to_string()))
     }
 }
 
@@ -88,6 +116,7 @@ impl Codec for ByteCodec {
 mod tests {
     use super::*;
     use crate::protocol::types::ShortStr;
+    use bytes::Bytes;
 
     fn meta<'a>(properties: &'a BasicProperties, routing_key: &'a str) -> MessageMeta<'a> {
         MessageMeta {
@@ -103,20 +132,16 @@ mod tests {
         fn content_type(&self) -> &str {
             "application/json"
         }
+    }
 
-        fn encode<T: serde::Serialize + 'static>(
-            &self,
-            value: &T,
-            _props: &mut BasicProperties,
-        ) -> Result<Vec<u8>, Error> {
+    impl<T: serde::Serialize + ?Sized> Encode<T> for TestCodec {
+        fn encode(&self, value: &T, _props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
             serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
         }
+    }
 
-        fn decode<T: serde::de::DeserializeOwned + 'static>(
-            &self,
-            bytes: &[u8],
-            _meta: &MessageMeta<'_>,
-        ) -> Result<T, Error> {
+    impl<T: serde::de::DeserializeOwned> Decode<T> for TestCodec {
+        fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<T, Error> {
             serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
         }
     }
@@ -129,12 +154,10 @@ mod tests {
         fn content_type(&self) -> &str {
             "application/json"
         }
+    }
 
-        fn encode<T: serde::Serialize + 'static>(
-            &self,
-            value: &T,
-            props: &mut BasicProperties,
-        ) -> Result<Vec<u8>, Error> {
+    impl<T: serde::Serialize + ?Sized> Encode<T> for RoutedCodec {
+        fn encode(&self, value: &T, props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
             let tagged = serde_json::to_value(value).map_err(|e| Error::Codec(e.to_string()))?;
             let (variant, body) = tagged
                 .as_object()
@@ -143,12 +166,10 @@ mod tests {
             props.type_field = Some(ShortStr::try_from(variant.as_str()).map_err(Error::Protocol)?);
             serde_json::to_vec(body).map_err(|e| Error::Codec(e.to_string()))
         }
+    }
 
-        fn decode<T: serde::de::DeserializeOwned + 'static>(
-            &self,
-            bytes: &[u8],
-            meta: &MessageMeta<'_>,
-        ) -> Result<T, Error> {
+    impl<T: serde::de::DeserializeOwned> Decode<T> for RoutedCodec {
+        fn decode(&self, bytes: &[u8], meta: &MessageMeta<'_>) -> Result<T, Error> {
             let variant = meta.routing_key.split('.').nth(1).unwrap_or_default();
             let body: serde_json::Value =
                 serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))?;
@@ -227,39 +248,60 @@ mod tests {
         assert_eq!(ByteCodec.content_type(), "application/octet-stream");
     }
 
-    #[test]
-    fn byte_codec_roundtrips_vec_u8() {
-        let original: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    /// `value` encoded by `ByteCodec`, which must leave the properties alone.
+    fn byte_encode<T: ?Sized>(value: &T) -> Vec<u8>
+    where
+        ByteCodec: Encode<T>,
+    {
         let mut props = BasicProperties::default();
-        let encoded = ByteCodec.encode(&original, &mut props).unwrap();
-        assert_eq!(encoded, original);
+        let encoded = ByteCodec.encode(value, &mut props).unwrap();
         assert_eq!(
             props,
             BasicProperties::default(),
             "ByteCodec set properties"
         );
-        let decoded: Vec<u8> = ByteCodec.decode(&encoded, &meta(&props, "k")).unwrap();
-        assert_eq!(decoded, original);
+        encoded
+    }
+
+    fn byte_decode<T>(bytes: &[u8]) -> Result<T, Error>
+    where
+        ByteCodec: Decode<T>,
+    {
+        ByteCodec.decode(bytes, &meta(&BasicProperties::default(), "k"))
     }
 
     #[test]
-    fn byte_codec_rejects_non_bytes_on_encode() {
-        let result = ByteCodec.encode(&String::from("oops"), &mut BasicProperties::default());
-        let err = result.unwrap_err();
-        match err {
-            Error::Codec(msg) => assert!(msg.contains("Vec<u8>")),
-            other => panic!("expected Codec error, got {other:?}"),
-        }
+    fn byte_codec_encodes_bytes_and_text() {
+        assert_eq!(byte_encode("hello"), b"hello");
+        assert_eq!(byte_encode(&String::from("hello")), b"hello");
+        assert_eq!(byte_encode(&b"hello"[..]), b"hello");
+        assert_eq!(byte_encode(b"hello"), b"hello");
+        assert_eq!(byte_encode(&b"hello".to_vec()), b"hello");
+        assert_eq!(byte_encode(&Bytes::from_static(b"hello")), b"hello");
     }
 
     #[test]
-    fn byte_codec_rejects_non_bytes_on_decode() {
-        let props = BasicProperties::default();
-        let result: Result<String, _> = ByteCodec.decode(b"oops", &meta(&props, "k"));
-        let err = result.unwrap_err();
-        match err {
-            Error::Codec(msg) => assert!(msg.contains("Vec<u8>")),
-            other => panic!("expected Codec error, got {other:?}"),
-        }
+    fn byte_codec_encodes_a_borrow_of_a_local() {
+        let owned = String::from("hello");
+        assert_eq!(byte_encode(owned.as_str()), b"hello");
+    }
+
+    #[test]
+    fn byte_codec_decodes_bytes_and_text() {
+        assert_eq!(
+            byte_decode::<Vec<u8>>(b"\xDE\xAD").unwrap(),
+            vec![0xDE, 0xAD]
+        );
+        assert_eq!(
+            byte_decode::<Bytes>(b"hello").unwrap(),
+            Bytes::from_static(b"hello")
+        );
+        assert_eq!(byte_decode::<String>(b"hello").unwrap(), "hello");
+    }
+
+    #[test]
+    fn byte_codec_rejects_invalid_utf8_as_string() {
+        let result = byte_decode::<String>(b"\xFF\xFE");
+        assert!(matches!(result, Err(Error::Codec(_))), "{result:?}");
     }
 }

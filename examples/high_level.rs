@@ -1,28 +1,29 @@
-use amqp_client_rs::{BasicProperties, Client, MessageMeta, QueueDeclareOpts, SubscribeOpts};
+use amqp_client_rs::{
+    BasicProperties, Client, Codec, Decode, Encode, Error, MessageMeta, QueueDeclareOpts,
+    SubscribeOpts,
+};
 use serde::{Deserialize, Serialize};
 
 // Bring your own codec (e.g. JSON via serde_json)
 struct JsonCodec;
 
-impl amqp_client_rs::Codec for JsonCodec {
+impl Codec for JsonCodec {
     fn content_type(&self) -> &str {
         "application/json"
     }
-    // `props` and `meta` let a codec set and read e.g. the `type` property;
-    // this one only needs the body.
-    fn encode<T: Serialize>(
-        &self,
-        value: &T,
-        _props: &mut BasicProperties,
-    ) -> Result<Vec<u8>, amqp_client_rs::Error> {
-        serde_json::to_vec(value).map_err(|e| amqp_client_rs::Error::Codec(e.to_string()))
+}
+
+// `props` and `meta` let a codec set and read e.g. the `type` property;
+// this one only needs the body.
+impl<T: Serialize + ?Sized> Encode<T> for JsonCodec {
+    fn encode(&self, value: &T, _props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
+        serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
     }
-    fn decode<T: serde::de::DeserializeOwned>(
-        &self,
-        bytes: &[u8],
-        _meta: &MessageMeta<'_>,
-    ) -> Result<T, amqp_client_rs::Error> {
-        serde_json::from_slice(bytes).map_err(|e| amqp_client_rs::Error::Codec(e.to_string()))
+}
+
+impl<T: serde::de::DeserializeOwned> Decode<T> for JsonCodec {
+    fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<T, Error> {
+        serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
     }
 }
 
@@ -32,7 +33,7 @@ struct MyMessage {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), amqp_client_rs::Error> {
+async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt().init();
 
     // build() does a single connection attempt — no built-in retry.

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use amqp_client_rs::{
-    BasicProperties, Client, Codec, Connection, DecodeFailure, Error, ExchangeDeclareOpts,
-    ExchangeKind, MessageMeta, QueueDeclareOpts, QueueDeleteOpts, RecoveryConfig, SubscribeOpts,
-    TypedConsumer, TypedDelivery,
+    BasicProperties, Client, Codec, Connection, Decode, DecodeFailure, Encode, Error,
+    ExchangeDeclareOpts, ExchangeKind, MessageMeta, QueueDeclareOpts, QueueDeleteOpts,
+    RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,20 +19,16 @@ impl Codec for JsonCodec {
     fn content_type(&self) -> &str {
         "application/json"
     }
+}
 
-    fn encode<T: serde::Serialize>(
-        &self,
-        value: &T,
-        _props: &mut BasicProperties,
-    ) -> Result<Vec<u8>, Error> {
+impl<T: Serialize + ?Sized> Encode<T> for JsonCodec {
+    fn encode(&self, value: &T, _props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
     }
+}
 
-    fn decode<T: serde::de::DeserializeOwned>(
-        &self,
-        bytes: &[u8],
-        _meta: &MessageMeta<'_>,
-    ) -> Result<T, Error> {
+impl<T: serde::de::DeserializeOwned> Decode<T> for JsonCodec {
+    fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<T, Error> {
         serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
     }
 }
@@ -140,7 +136,7 @@ async fn client_publish_with_props() {
 }
 
 #[allow(clippy::result_large_err)]
-async fn next_raw<T: serde::de::DeserializeOwned + 'static, C: Codec>(
+async fn next_raw<T, C: Decode<T>>(
     consumer: &mut TypedConsumer<T, C>,
 ) -> Result<TypedDelivery<T>, DecodeFailure> {
     tokio::time::timeout(Duration::from_secs(5), consumer.next())
@@ -204,6 +200,21 @@ async fn settling_a_no_ack_delivery_keeps_the_consumer() {
     assert_eq!(d.body, greeting(2));
 }
 
+/// The default codec publishes text and byte literals and decodes text (#6).
+#[tokio::test]
+async fn the_default_codec_publishes_and_consumes_text() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let q = client.queue("", exclusive()).await.unwrap();
+    client.publish("", &q.name(), "hello").await.unwrap();
+    client.publish("", &q.name(), b"bytes").await.unwrap();
+    let mut consumer = q
+        .subscribe::<String>(SubscribeOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(next_raw(&mut consumer).await.unwrap().body, "hello");
+    assert_eq!(next_raw(&mut consumer).await.unwrap().body, "bytes");
+}
+
 /// JSON that sets `type` on encode and decodes only messages of that type.
 struct TypedJsonCodec;
 
@@ -211,21 +222,17 @@ impl Codec for TypedJsonCodec {
     fn content_type(&self) -> &str {
         "application/json"
     }
+}
 
-    fn encode<T: serde::Serialize + 'static>(
-        &self,
-        value: &T,
-        props: &mut BasicProperties,
-    ) -> Result<Vec<u8>, Error> {
+impl<T: Serialize + ?Sized> Encode<T> for TypedJsonCodec {
+    fn encode(&self, value: &T, props: &mut BasicProperties) -> Result<Vec<u8>, Error> {
         props.type_field = Some("greeting".try_into().unwrap());
         JsonCodec.encode(value, props)
     }
+}
 
-    fn decode<T: serde::de::DeserializeOwned + 'static>(
-        &self,
-        bytes: &[u8],
-        meta: &MessageMeta<'_>,
-    ) -> Result<T, Error> {
+impl<T: serde::de::DeserializeOwned> Decode<T> for TypedJsonCodec {
+    fn decode(&self, bytes: &[u8], meta: &MessageMeta<'_>) -> Result<T, Error> {
         match meta.properties.type_field.as_ref().map(|t| t.as_str()) {
             Some(Ok("greeting")) => JsonCodec.decode(bytes, meta),
             other => Err(Error::Codec(format!("unknown type {other:?}"))),

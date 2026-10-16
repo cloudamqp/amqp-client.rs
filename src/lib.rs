@@ -47,8 +47,9 @@ pub use error::{Error, ProtocolError};
 #[cfg(feature = "compression")]
 pub use high_level::Compression;
 pub use high_level::{
-    ByteCodec, Client, ClientBuilder, Codec, ContentEncoder, DecodeFailure, Exchange, ExchangeKind,
-    Identity, MessageMeta, Queue, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
+    ByteCodec, Client, ClientBuilder, Codec, ContentEncoder, Decode, DecodeFailure, Encode,
+    Exchange, ExchangeKind, Identity, MessageMeta, Queue, RecoveryConfig, SubscribeOpts,
+    TypedConsumer, TypedDelivery,
 };
 pub use protocol::properties::BasicProperties;
 pub use protocol::table::{FieldValue, Table};
