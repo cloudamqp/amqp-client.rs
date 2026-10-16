@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use amqp_client_rs::{
     BasicProperties, Client, Codec, Connection, Decode, DecodeFailure, Encode, Error,
-    ExchangeDeclareOpts, ExchangeKind, MessageMeta, QueueDeclareOpts, QueueDeleteOpts,
-    RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
+    ExchangeDeclareOpts, ExchangeKind, ExchangeOpts, MessageMeta, QueueDeclareOpts,
+    QueueDeleteOpts, QueueOpts, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
 };
 use serde::{Deserialize, Serialize};
 
@@ -443,7 +443,12 @@ async fn client_build_fails_fast_on_unreachable_host() {
 async fn client_declares_exchanges_of_each_kind() {
     let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
     let conn = Connection::connect(AMQP_URI).await.unwrap();
-    let opts = ExchangeDeclareOpts::default;
+    let opts = ExchangeOpts::default;
+    // What the high-level declares are, so the low-level redeclare is equivalent.
+    let durable = || ExchangeDeclareOpts {
+        durable: true,
+        ..Default::default()
+    };
     let name = |label: &str| queue_name(&format!("ex-{label}"));
 
     let declared = [
@@ -467,7 +472,7 @@ async fn client_declares_exchanges_of_each_kind() {
     for (exchange, kind) in &declared {
         assert_eq!(exchange.name(), name(kind));
         let ch = conn.open_channel().await.unwrap();
-        ch.exchange_declare(exchange.name(), kind, opts())
+        ch.exchange_declare(exchange.name(), kind, durable())
             .await
             .unwrap();
         let other = if *kind == "fanout" {
@@ -476,7 +481,7 @@ async fn client_declares_exchanges_of_each_kind() {
             "fanout"
         };
         let ch = conn.open_channel().await.unwrap();
-        let refused = ch.exchange_declare(exchange.name(), other, opts()).await;
+        let refused = ch.exchange_declare(exchange.name(), other, durable()).await;
         assert!(refused.is_err());
     }
 
@@ -486,55 +491,84 @@ async fn client_declares_exchanges_of_each_kind() {
     }
 }
 
-/// A named queue keeps its name; it exists on the broker.
+/// A named queue keeps its name and is durable: redeclaring it durable is
+/// accepted, transient is refused (ADR-0008).
 #[tokio::test]
-async fn client_declares_a_named_queue() {
+async fn client_declares_a_named_queue_durable() {
     let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
     let name = queue_name("named");
-    let q = client
-        .queue(&name, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&name, QueueOpts::default()).await.unwrap();
     assert_eq!(q.name(), name);
 
-    let passive = QueueDeclareOpts {
-        passive: true,
+    let durable = QueueDeclareOpts {
+        durable: true,
         ..Default::default()
     };
-    let ch = client.channel();
-    ch.queue_declare(&name, passive).await.unwrap();
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    ch.queue_declare(&name, durable).await.unwrap();
+    let refused = conn
+        .open_channel()
+        .await
+        .unwrap()
+        .queue_declare(&name, QueueDeclareOpts::default())
+        .await;
+    assert!(refused.is_err(), "the queue is not durable");
     ch.queue_delete(&name, QueueDeleteOpts::default())
         .await
         .unwrap();
 }
 
-/// A server-named queue takes the name the broker assigned.
+/// A server-named queue takes the name the broker assigned, and is exclusive
+/// and transient (ADR-0008).
 #[tokio::test]
-async fn client_declares_a_server_named_queue() {
+async fn client_declares_a_server_named_queue_exclusive_and_transient() {
     let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
-    let exclusive = QueueDeclareOpts {
-        exclusive: true,
-        ..Default::default()
-    };
-    let q = client.queue("", exclusive).await.unwrap();
+    let q = client.queue("", QueueOpts::default()).await.unwrap();
     assert!(!q.name().is_empty());
 
-    let passive = QueueDeclareOpts {
-        passive: true,
+    let temporary = QueueDeclareOpts {
+        exclusive: true,
         ..Default::default()
     };
     client
         .channel()
-        .queue_declare(&q.name(), passive)
+        .queue_declare(&q.name(), temporary)
         .await
         .unwrap();
 }
 
-fn exclusive() -> QueueDeclareOpts {
-    QueueDeclareOpts {
-        exclusive: true,
+/// An exchange is durable: redeclaring it durable is accepted, transient is
+/// refused (ADR-0008).
+#[tokio::test]
+async fn client_declares_a_durable_exchange() {
+    let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
+    let ex = client
+        .topic(&queue_name("durable-ex"), ExchangeOpts::default())
+        .await
+        .unwrap();
+
+    let durable = ExchangeDeclareOpts {
+        durable: true,
         ..Default::default()
-    }
+    };
+    let conn = Connection::connect(AMQP_URI).await.unwrap();
+    let ch = conn.open_channel().await.unwrap();
+    ch.exchange_declare(ex.name(), "topic", durable)
+        .await
+        .unwrap();
+    let refused = conn
+        .open_channel()
+        .await
+        .unwrap()
+        .exchange_declare(ex.name(), "topic", ExchangeDeclareOpts::default())
+        .await;
+    assert!(refused.is_err(), "the exchange is not durable");
+    ch.exchange_delete(ex.name(), false).await.unwrap();
+}
+
+fn exclusive() -> QueueOpts {
+    QueueOpts::default().exclusive(true)
 }
 
 async fn has_message(client: &Client, queue: &str) -> bool {
@@ -551,7 +585,7 @@ async fn has_message(client: &Client, queue: &str) -> bool {
 async fn queue_binds_and_unbinds() {
     let client = Client::builder(AMQP_URI).unwrap().build().await.unwrap();
     let ex = client
-        .topic(&queue_name("bind-ex"), ExchangeDeclareOpts::default())
+        .topic(&queue_name("bind-ex"), ExchangeOpts::default())
         .await
         .unwrap();
     let q = client.queue("", exclusive()).await.unwrap();
@@ -595,10 +629,7 @@ async fn queue_binds_by_exchange_name() {
 async fn queue_delete_ends_its_consumers() {
     let client = json_client().await;
     let name = queue_name("delete");
-    let q = client
-        .queue(&name, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&name, QueueOpts::default()).await.unwrap();
     let mut consumer = q
         .subscribe::<Greeting>(SubscribeOpts::default())
         .await
@@ -711,14 +742,11 @@ async fn delete_elsewhere(queue: &str) {
 async fn consumer_recovers_after_queue_deleted_elsewhere() {
     let client = recovering_json_client().await;
     let ex = client
-        .topic(&queue_name("cancel-ex"), ExchangeDeclareOpts::default())
+        .topic(&queue_name("cancel-ex"), ExchangeOpts::default())
         .await
         .unwrap();
     let name = queue_name("cancel");
-    let q = client
-        .queue(&name, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&name, QueueOpts::default()).await.unwrap();
     q.bind(&ex, "k").await.unwrap();
     let mut consumer = q
         .subscribe::<Greeting>(SubscribeOpts::default())
@@ -744,13 +772,10 @@ async fn consumer_recovers_after_queue_deleted_elsewhere() {
 async fn deleted_server_named_queue_comes_back_renamed() {
     let client = recovering_json_client().await;
     let ex = client
-        .topic(&queue_name("rename-ex"), ExchangeDeclareOpts::default())
+        .topic(&queue_name("rename-ex"), ExchangeOpts::default())
         .await
         .unwrap();
-    let auto_delete = QueueDeclareOpts {
-        auto_delete: true,
-        ..Default::default()
-    };
+    let auto_delete = QueueOpts::default().exclusive(false).auto_delete(true);
     let q = client.queue("", auto_delete).await.unwrap();
     q.bind(&ex, "k").await.unwrap();
     let old_name = q.name();
@@ -776,7 +801,7 @@ async fn deleted_server_named_queue_comes_back_renamed() {
 async fn queue_delete_ends_its_consumers_with_recovery() {
     let client = recovering_json_client().await;
     let q = client
-        .queue(&queue_name("delete-recovery"), QueueDeclareOpts::default())
+        .queue(&queue_name("delete-recovery"), QueueOpts::default())
         .await
         .unwrap();
     let mut consumer = q
@@ -815,14 +840,11 @@ async fn client_reopens_its_channel_after_the_broker_closes_it() {
 async fn consumer_recovery_declares_a_deleted_exchange_again() {
     let client = recovering_json_client().await;
     let ex = client
-        .topic(&queue_name("gone-ex"), ExchangeDeclareOpts::default())
+        .topic(&queue_name("gone-ex"), ExchangeOpts::default())
         .await
         .unwrap();
     let name = queue_name("gone-ex-q");
-    let q = client
-        .queue(&name, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&name, QueueOpts::default()).await.unwrap();
     q.bind(&ex, "k").await.unwrap();
     let mut consumer = q
         .subscribe::<Greeting>(SubscribeOpts::default())
@@ -901,11 +923,7 @@ async fn publish_confirmed_reports_a_nack() {
         amqp_client_rs::ShortStr::try_from("x-overflow").unwrap(),
         amqp_client_rs::FieldValue::LongStr(amqp_client_rs::LongStr::from("reject-publish")),
     );
-    let opts = QueueDeclareOpts {
-        exclusive: true,
-        arguments,
-        ..Default::default()
-    };
+    let opts = QueueOpts::default().exclusive(true).arguments(arguments);
     let q = client.queue("", opts).await.unwrap();
 
     client
@@ -923,10 +941,7 @@ async fn queue_delete_while_the_consumer_is_polled() {
     for i in 0..5 {
         let client = recovering_json_client().await;
         let name = queue_name(&format!("delete-polled-{i}"));
-        let q = client
-            .queue(&name, QueueDeclareOpts::default())
-            .await
-            .unwrap();
+        let q = client.queue(&name, QueueOpts::default()).await.unwrap();
         let mut consumer = q
             .subscribe::<Greeting>(SubscribeOpts::default())
             .await
@@ -987,8 +1002,8 @@ async fn delete_named(name: &str) {
 async fn overlapping_deletes_leave_other_queues_alone() {
     let client = recovering_json_client().await;
     let (a, b) = (queue_name("dd-a"), queue_name("dd-b"));
-    let qa = client.queue(&a, QueueDeclareOpts::default()).await.unwrap();
-    client.queue(&b, QueueDeclareOpts::default()).await.unwrap();
+    let qa = client.queue(&a, QueueOpts::default()).await.unwrap();
+    client.queue(&b, QueueOpts::default()).await.unwrap();
 
     let qa2 = qa.clone();
     let (first, second) = tokio::join!(
@@ -1012,11 +1027,11 @@ async fn a_bind_during_a_delete_leaves_other_queues_alone() {
     let client = recovering_json_client().await;
     let (a, b) = (queue_name("bd-a"), queue_name("bd-b"));
     let ex = client
-        .fanout(&queue_name("bd-ex"), ExchangeDeclareOpts::default())
+        .fanout(&queue_name("bd-ex"), ExchangeOpts::default())
         .await
         .unwrap();
-    let qa = client.queue(&a, QueueDeclareOpts::default()).await.unwrap();
-    client.queue(&b, QueueDeclareOpts::default()).await.unwrap();
+    let qa = client.queue(&a, QueueOpts::default()).await.unwrap();
+    client.queue(&b, QueueOpts::default()).await.unwrap();
 
     let qa2 = qa.clone();
     let (deleted, bound) = tokio::join!(qa.delete(QueueDeleteOpts::default()), qa2.bind(&ex, ""));
@@ -1043,10 +1058,7 @@ async fn a_bind_during_a_delete_leaves_other_queues_alone() {
 async fn deleting_an_already_deleted_queue_succeeds() {
     let client = recovering_json_client().await;
     let name = queue_name("gone-already");
-    let q = client
-        .queue(&name, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&name, QueueOpts::default()).await.unwrap();
     delete_named(&name).await;
 
     assert_eq!(q.delete(QueueDeleteOpts::default()).await.unwrap(), 0);
