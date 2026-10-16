@@ -48,7 +48,8 @@ pub use error::{Error, ProtocolError};
 pub use high_level::Compression;
 pub use high_level::{
     ByteCodec, Client, ClientBuilder, Codec, ContentEncoder, DecodeFailure, Exchange, ExchangeKind,
-    Identity, MessageMeta, Queue, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
+    ExchangeOpts, Identity, MessageMeta, Queue, QueueOpts, RecoveryConfig, SubscribeOpts,
+    TypedConsumer, TypedDelivery,
 };
 pub use protocol::properties::BasicProperties;
 pub use protocol::table::{FieldValue, Table};

@@ -6,9 +6,7 @@
 
 use std::time::Duration;
 
-use amqp_client_rs::{
-    Client, ExchangeDeclareOpts, QueueDeclareOpts, RecoveryConfig, SubscribeOpts,
-};
+use amqp_client_rs::{Client, ExchangeOpts, QueueOpts, RecoveryConfig, SubscribeOpts};
 use tokio::time::MissedTickBehavior;
 
 #[tokio::main]
@@ -28,12 +26,9 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
 
     // Declared through the client, so declared again after reconnecting.
     let exchange = client
-        .topic("recovery-demo", ExchangeDeclareOpts::default())
+        .topic("recovery-demo", ExchangeOpts::default())
         .await?;
-    let exclusive = QueueDeclareOpts {
-        exclusive: true,
-        ..Default::default()
-    };
+    let exclusive = QueueOpts::default().exclusive(true);
     let queue = client.queue("", exclusive).await?;
     queue.bind(&exchange, "demo.#").await?;
     let mut queue_name = queue.name();

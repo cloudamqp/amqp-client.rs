@@ -79,7 +79,7 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
 ### High-level client
 
 ```rust
-use amqp_client_rs::{Client, ExchangeDeclareOpts, QueueDeclareOpts, SubscribeOpts};
+use amqp_client_rs::{Client, ExchangeOpts, QueueOpts, SubscribeOpts};
 
 // `JsonCodec` is your own `Codec`, e.g. over serde_json (see examples/high_level.rs).
 async fn run() -> Result<(), amqp_client_rs::Error> {
@@ -88,8 +88,8 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
         .build()
         .await?;
 
-    let orders = client.topic("orders", ExchangeDeclareOpts::default()).await?;
-    let queue = client.queue("order-events", QueueDeclareOpts::default()).await?;
+    let orders = client.topic("orders", ExchangeOpts::default()).await?;
+    let queue = client.queue("order-events", QueueOpts::default()).await?;
     queue.bind(&orders, "order.*").await?;   // or by name: queue.bind("amq.topic", ..)
 
     client.publish(orders.name(), "order.created", &"order 42").await?;
@@ -112,6 +112,14 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
     Ok(())
 }
 ```
+
+Exchanges and named queues declared through the client are durable by
+default. A server-named queue (`client.queue("", ..)`) is exclusive and
+transient, and so is any exclusive queue; nothing is auto-delete unless set.
+Override with e.g. `QueueOpts::default().durable(false)`
+([ADR-0008](docs/adr/0008-high-level-declares-are-durable-by-default.md)). The
+low-level `queue_declare` / `exchange_declare` map 1:1 to AMQP, transient by
+default.
 
 A delivery that fails to decode arrives as a `DecodeFailure` with the raw
 body. The client does not settle it: ack, reject or requeue it yourself

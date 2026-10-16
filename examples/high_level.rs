@@ -1,4 +1,4 @@
-use amqp_client_rs::{BasicProperties, Client, MessageMeta, QueueDeclareOpts, SubscribeOpts};
+use amqp_client_rs::{BasicProperties, Client, MessageMeta, QueueOpts, SubscribeOpts};
 use serde::{Deserialize, Serialize};
 
 // Bring your own codec (e.g. JSON via serde_json)
@@ -41,9 +41,7 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
         .build()
         .await?;
 
-    let queue = client
-        .queue("my-queue", QueueDeclareOpts::default())
-        .await?;
+    let queue = client.queue("my-queue", QueueOpts::default()).await?;
 
     client
         .publish(
