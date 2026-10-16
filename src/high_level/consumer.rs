@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use tracing::warn;
 
-use super::codec::Codec;
+use super::codec::{Codec, Decode};
 use super::delivery::{DecodeFailure, TypedDelivery, decode_delivery};
 use super::queue::Queue;
 use super::session::{ConsumerRegistration, session_after};
@@ -92,7 +92,7 @@ struct Recovered {
     generation: u64,
 }
 
-impl<T: serde::de::DeserializeOwned + 'static, C: Codec> TypedConsumer<T, C> {
+impl<T, C: Decode<T>> TypedConsumer<T, C> {
     pub(crate) fn new(
         inner: Consumer,
         channel: Channel,
@@ -185,7 +185,7 @@ impl<T, C: Codec> TypedConsumer<T, C> {
     }
 }
 
-impl<T: serde::de::DeserializeOwned + 'static, C: Codec> Stream for TypedConsumer<T, C> {
+impl<T, C: Decode<T>> Stream for TypedConsumer<T, C> {
     type Item = Result<TypedDelivery<T>, DecodeFailure>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

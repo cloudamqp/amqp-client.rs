@@ -12,7 +12,7 @@ mod session;
 mod topology;
 
 pub use client::{Client, ClientBuilder};
-pub use codec::{ByteCodec, Codec, MessageMeta};
+pub use codec::{ByteCodec, Codec, Decode, Encode, MessageMeta};
 #[cfg(feature = "compression")]
 pub use compression::Compression;
 pub use consumer::{SubscribeOpts, TypedConsumer};

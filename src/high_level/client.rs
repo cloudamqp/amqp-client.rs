@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 
-use super::codec::{ByteCodec, Codec};
+use super::codec::{ByteCodec, Codec, Encode};
 use super::encoding::{ContentEncoder, Identity};
 use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
@@ -135,12 +135,23 @@ impl<C: Codec> Client<C> {
     /// Publish a serialized message to an exchange with the given routing key.
     ///
     /// The codec's `content_type` is set automatically on the message properties.
-    pub async fn publish<T: serde::Serialize + 'static>(
+    /// `body` must be a type the codec implements [`Encode`] for; any other
+    /// type does not compile:
+    ///
+    /// ```compile_fail
+    /// # async fn f(client: amqp_client_rs::Client) -> Result<(), amqp_client_rs::Error> {
+    /// client.publish("", "q", &42u32).await // ByteCodec: Encode<u32> is not satisfied
+    /// # }
+    /// ```
+    pub async fn publish<T: ?Sized>(
         &self,
         exchange: &str,
         routing_key: &str,
         body: &T,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        C: Encode<T>,
+    {
         let props = BasicProperties::builder()
             .content_type(self.codec.content_type())
             .build()?;
@@ -152,13 +163,16 @@ impl<C: Codec> Client<C> {
     /// If the provided properties do not already have a `content_type` set, the
     /// codec's content type is used. The codec's `encode` may add to or
     /// overwrite them.
-    pub async fn publish_with_props<T: serde::Serialize + 'static>(
+    pub async fn publish_with_props<T: ?Sized>(
         &self,
         exchange: &str,
         routing_key: &str,
         body: &T,
         mut props: BasicProperties,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        C: Encode<T>,
+    {
         if props.content_type.is_none() {
             props.content_type =
                 Some(ShortStr::try_from(self.codec.content_type()).map_err(Error::Protocol)?);
@@ -179,25 +193,31 @@ impl<C: Codec> Client<C> {
     /// publish that could not be sent because the connection was already
     /// gone is sent once more on the recovered connection. Confirms are
     /// requested on a channel of their own.
-    pub async fn publish_confirmed<T: serde::Serialize + 'static>(
+    pub async fn publish_confirmed<T: ?Sized>(
         &self,
         exchange: &str,
         routing_key: &str,
         body: &T,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        C: Encode<T>,
+    {
         self.publish_confirmed_with_props(exchange, routing_key, body, BasicProperties::default())
             .await
     }
 
     /// [`Client::publish_confirmed`] with custom properties. If they have no
     /// `content_type`, the codec's is used.
-    pub async fn publish_confirmed_with_props<T: serde::Serialize + 'static>(
+    pub async fn publish_confirmed_with_props<T: ?Sized>(
         &self,
         exchange: &str,
         routing_key: &str,
         body: &T,
         mut props: BasicProperties,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        C: Encode<T>,
+    {
         if props.content_type.is_none() {
             props.content_type =
                 Some(ShortStr::try_from(self.codec.content_type()).map_err(Error::Protocol)?);
@@ -228,22 +248,24 @@ impl<C: Codec> Client<C> {
     }
 
     /// The wire body for `body`: the codec's, content-encoded (ADR-0005).
-    fn encode<T: serde::Serialize + 'static>(
-        &self,
-        body: &T,
-        props: &mut BasicProperties,
-    ) -> Result<Vec<u8>, Error> {
+    fn encode<T: ?Sized>(&self, body: &T, props: &mut BasicProperties) -> Result<Vec<u8>, Error>
+    where
+        C: Encode<T>,
+    {
         let encoded = self.codec.encode(body, props)?;
         self.encoder.encode(encoded, props)
     }
 
-    async fn publish_inner<T: serde::Serialize + 'static>(
+    async fn publish_inner<T: ?Sized>(
         &self,
         exchange: &str,
         routing_key: &str,
         body: &T,
         mut props: BasicProperties,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        C: Encode<T>,
+    {
         let encoded = self.encode(body, &mut props)?;
         self.inner
             .with_session(|s| {

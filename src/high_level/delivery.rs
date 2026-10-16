@@ -1,4 +1,4 @@
-use super::codec::{Codec, MessageMeta};
+use super::codec::{Decode, MessageMeta};
 use super::encoding::ContentEncoder;
 use crate::client::message::DeliverMessage;
 use crate::error::Error;
@@ -127,8 +127,7 @@ pub(crate) fn decode_delivery<T, C>(
     no_ack: bool,
 ) -> Result<TypedDelivery<T>, DecodeFailure>
 where
-    T: serde::de::DeserializeOwned + 'static,
-    C: Codec,
+    C: Decode<T>,
 {
     let properties = msg.properties.clone();
     let exchange = msg.exchange.to_string();
@@ -140,7 +139,7 @@ where
     };
     let decoded = encoder
         .decode(&msg.body, &meta)
-        .and_then(|body| codec.decode::<T>(&body, &meta));
+        .and_then(|body| codec.decode(&body, &meta));
     let (delivery_tag, redelivered) = (msg.delivery_tag, msg.redelivered);
     match decoded {
         Ok(body) => Ok(TypedDelivery {
@@ -171,6 +170,7 @@ mod tests {
     use crate::client::connection::OutgoingFrame;
     use crate::client::message::test_delivery;
     use crate::high_level::ByteCodec;
+    use crate::high_level::codec::Codec;
     use crate::high_level::encoding::Identity;
     use crate::protocol::frame::Frame;
     use crate::protocol::method::MethodFrame;
@@ -181,20 +181,10 @@ mod tests {
         fn content_type(&self) -> &str {
             "application/json"
         }
+    }
 
-        fn encode<T: serde::Serialize + 'static>(
-            &self,
-            value: &T,
-            _props: &mut BasicProperties,
-        ) -> Result<Vec<u8>, Error> {
-            serde_json::to_vec(value).map_err(|e| Error::Codec(e.to_string()))
-        }
-
-        fn decode<T: serde::de::DeserializeOwned + 'static>(
-            &self,
-            bytes: &[u8],
-            _meta: &MessageMeta<'_>,
-        ) -> Result<T, Error> {
+    impl<T: serde::de::DeserializeOwned> Decode<T> for JsonCodec {
+        fn decode(&self, bytes: &[u8], _meta: &MessageMeta<'_>) -> Result<T, Error> {
             serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
         }
     }
@@ -206,29 +196,17 @@ mod tests {
         fn content_type(&self) -> &str {
             "text/plain"
         }
+    }
 
-        fn encode<T: serde::Serialize + 'static>(
-            &self,
-            _value: &T,
-            _props: &mut BasicProperties,
-        ) -> Result<Vec<u8>, Error> {
-            unreachable!()
-        }
-
-        fn decode<T: serde::de::DeserializeOwned + 'static>(
-            &self,
-            _bytes: &[u8],
-            meta: &MessageMeta<'_>,
-        ) -> Result<T, Error> {
+    impl Decode<String> for MetaCodec {
+        fn decode(&self, _bytes: &[u8], meta: &MessageMeta<'_>) -> Result<String, Error> {
             let kind = meta.properties.type_field.as_ref().unwrap();
-            let s = format!(
+            Ok(format!(
                 "{} {} {}",
                 meta.exchange,
                 meta.routing_key,
                 kind.as_str().unwrap()
-            );
-            serde_json::from_value(serde_json::Value::String(s))
-                .map_err(|e| Error::Codec(e.to_string()))
+            ))
         }
     }
 
@@ -267,7 +245,7 @@ mod tests {
 
     #[test]
     fn a_decode_failure_can_be_rejected() {
-        let (msg, mut rx) = test_delivery(b"x", BasicProperties::default());
+        let (msg, mut rx) = test_delivery(b"\xFF", BasicProperties::default());
         let f = decode_delivery::<String, _>(&ByteCodec, &Identity, msg, false).unwrap_err();
         f.reject(false).unwrap();
         assert!(matches!(
@@ -299,7 +277,7 @@ mod tests {
 
     #[test]
     fn settling_a_no_ack_decode_failure_errors_without_sending() {
-        let (msg, mut rx) = test_delivery(b"x", BasicProperties::default());
+        let (msg, mut rx) = test_delivery(b"\xFF", BasicProperties::default());
         let f = decode_delivery::<String, _>(&ByteCodec, &Identity, msg, true).unwrap_err();
         assert!(matches!(f.ack(), Err(Error::NoAck)));
         assert!(matches!(f.reject(false), Err(Error::NoAck)));

@@ -81,18 +81,14 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
 ```rust
 use amqp_client_rs::{Client, ExchangeDeclareOpts, QueueDeclareOpts, SubscribeOpts};
 
-// `JsonCodec` is your own `Codec`, e.g. over serde_json (see examples/high_level.rs).
 async fn run() -> Result<(), amqp_client_rs::Error> {
-    let client = Client::builder("amqp://guest:guest@localhost")?
-        .codec(JsonCodec)
-        .build()
-        .await?;
+    let client = Client::builder("amqp://guest:guest@localhost")?.build().await?;
 
     let orders = client.topic("orders", ExchangeDeclareOpts::default()).await?;
     let queue = client.queue("order-events", QueueDeclareOpts::default()).await?;
     queue.bind(&orders, "order.*").await?;   // or by name: queue.bind("amq.topic", ..)
 
-    client.publish(orders.name(), "order.created", &"order 42").await?;
+    client.publish(orders.name(), "order.created", "order 42").await?;
 
     let mut consumer = queue
         .subscribe::<String>(SubscribeOpts { prefetch: 50, ..Default::default() })
@@ -112,6 +108,14 @@ async fn run() -> Result<(), amqp_client_rs::Error> {
     Ok(())
 }
 ```
+
+The default `ByteCodec` publishes `&str`, `String`, byte slices, byte arrays,
+`Vec<u8>` and `Bytes`, and decodes into `String`, `Vec<u8>` and `Bytes`. For
+typed messages, set your own codec with `.codec(..)`: it implements
+`Encode<T>` and `Decode<T>` for the types it supports, e.g. every serde type
+(see examples/high_level.rs). Publishing or subscribing with a type the codec
+does not support is a compile error
+([ADR-0007](docs/adr/0007-codec-traits-keyed-on-body-type.md)).
 
 A delivery that fails to decode arrives as a `DecodeFailure` with the raw
 body. The client does not settle it: ack, reject or requeue it yourself

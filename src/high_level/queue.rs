@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, Weak};
 
-use super::codec::{ByteCodec, Codec};
+use super::codec::{ByteCodec, Codec, Decode};
 use super::consumer::{SubscribeOpts, TypedConsumer};
 use super::encoding::ContentEncoder;
 use super::session::{ClientInner, Session};
@@ -127,10 +127,10 @@ impl<C: Codec> Queue<C> {
 
     /// Start consuming on a channel of its own, with `opts.prefetch` set on
     /// that channel. Messages are decoded with the client's codec.
-    pub async fn subscribe<T: serde::de::DeserializeOwned + 'static>(
-        &self,
-        opts: SubscribeOpts,
-    ) -> Result<TypedConsumer<T, C>, Error> {
+    pub async fn subscribe<T>(&self, opts: SubscribeOpts) -> Result<TypedConsumer<T, C>, Error>
+    where
+        C: Decode<T>,
+    {
         let client = self.client()?;
         let _guard = self.lock().await;
         let name = self.recorded_name()?;
