@@ -9,7 +9,7 @@ An AMQP 0-9-1 client library for Rust, built on [tokio](https://tokio.rs).
 - Async/await with tokio
 - Clean two-layer architecture: runtime-agnostic protocol layer + tokio client layer
 - High-level `Client`: typed messages via a `Codec`, `Exchange`/`Queue` handles, one channel per consumer
-- Low-level fluent wrappers in `amqp_client_rs::low_level`
+- Low-level fluent wrappers in `amqp_client::low_level`
 
 ## Quick Start
 
@@ -17,17 +17,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-amqp-client-rs = "0.1"
+amqp-client = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ### Publish
 
 ```rust
-use amqp_client_rs::{BasicProperties, Connection, QueueDeclareOpts};
+use amqp_client::{BasicProperties, Connection, QueueDeclareOpts};
 
 #[tokio::main]
-async fn main() -> Result<(), amqp_client_rs::Error> {
+async fn main() -> Result<(), amqp_client::Error> {
     let conn = Connection::connect("amqp://guest:guest@localhost").await?;
     let ch = conn.open_channel().await?;
 
@@ -53,10 +53,10 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
 ### Consume
 
 ```rust
-use amqp_client_rs::{Connection, ConsumeOpts, QueueDeclareOpts};
+use amqp_client::{Connection, ConsumeOpts, QueueDeclareOpts};
 
 #[tokio::main]
-async fn main() -> Result<(), amqp_client_rs::Error> {
+async fn main() -> Result<(), amqp_client::Error> {
     let conn = Connection::connect("amqp://guest:guest@localhost").await?;
     let ch = conn.open_channel().await?;
 
@@ -79,9 +79,9 @@ async fn main() -> Result<(), amqp_client_rs::Error> {
 ### High-level client
 
 ```rust
-use amqp_client_rs::{Client, ExchangeOpts, QueueOpts, SubscribeOpts};
+use amqp_client::{Client, ExchangeOpts, QueueOpts, SubscribeOpts};
 
-async fn run() -> Result<(), amqp_client_rs::Error> {
+async fn run() -> Result<(), amqp_client::Error> {
     let client = Client::builder("amqp://guest:guest@localhost")?.build().await?;
 
     let orders = client.topic("orders", ExchangeOpts::default()).await?;

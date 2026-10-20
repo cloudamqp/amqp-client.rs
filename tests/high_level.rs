@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use amqp_client_rs::{
+use amqp_client::{
     BasicProperties, Client, Codec, Connection, Decode, DecodeFailure, Encode, Error,
     ExchangeDeclareOpts, ExchangeKind, ExchangeOpts, MessageMeta, QueueDeclareOpts,
     QueueDeleteOpts, QueueOpts, RecoveryConfig, SubscribeOpts, TypedConsumer, TypedDelivery,
@@ -48,7 +48,7 @@ struct Greeting {
 // ---------------------------------------------------------------------------
 
 fn queue_name(label: &str) -> String {
-    format!("amqp-client-rs-hl-test-{}-{}", label, std::process::id())
+    format!("amqp-client-hl-test-{}-{}", label, std::process::id())
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +302,7 @@ async fn identity_returns_compressed_deliveries_as_failures() {
 async fn gzip_client() -> Client {
     Client::builder(AMQP_URI)
         .unwrap()
-        .encoding(amqp_client_rs::Compression::gzip())
+        .encoding(amqp_client::Compression::gzip())
         .build()
         .await
         .unwrap()
@@ -914,14 +914,14 @@ async fn publish_confirmed_to_a_missing_exchange_fails() {
 #[tokio::test]
 async fn publish_confirmed_reports_a_nack() {
     let client = json_client().await;
-    let mut arguments = amqp_client_rs::Table::new();
+    let mut arguments = amqp_client::Table::new();
     arguments.insert(
-        amqp_client_rs::ShortStr::try_from("x-max-length").unwrap(),
-        amqp_client_rs::FieldValue::LongLongInt(1),
+        amqp_client::ShortStr::try_from("x-max-length").unwrap(),
+        amqp_client::FieldValue::LongLongInt(1),
     );
     arguments.insert(
-        amqp_client_rs::ShortStr::try_from("x-overflow").unwrap(),
-        amqp_client_rs::FieldValue::LongStr(amqp_client_rs::LongStr::from("reject-publish")),
+        amqp_client::ShortStr::try_from("x-overflow").unwrap(),
+        amqp_client::FieldValue::LongStr(amqp_client::LongStr::from("reject-publish")),
     );
     let opts = QueueOpts::default().exclusive(true).arguments(arguments);
     let q = client.queue("", opts).await.unwrap();

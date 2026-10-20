@@ -143,7 +143,7 @@ impl<C: Codec> Client<C> {
     /// type does not compile:
     ///
     /// ```compile_fail
-    /// # async fn f(client: amqp_client_rs::Client) -> Result<(), amqp_client_rs::Error> {
+    /// # async fn f(client: amqp_client::Client) -> Result<(), amqp_client::Error> {
     /// client.publish("", "q", &42u32).await // ByteCodec: Encode<u32> is not satisfied
     /// # }
     /// ```

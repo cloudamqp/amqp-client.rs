@@ -5,7 +5,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use amqp_client_rs::{
+use amqp_client::{
     Client, Connection, Error, ExchangeOpts, QueueDeclareOk, QueueDeclareOpts, QueueDeleteOpts,
     QueueOpts, RecoveryConfig, SubscribeOpts,
 };
@@ -14,7 +14,7 @@ use support::proxy::Proxy;
 const AMQP_URI: &str = "amqp://guest:guest@127.0.0.1";
 
 fn name(label: &str) -> String {
-    format!("amqp-client-rs-recovery-{}-{}", label, std::process::id())
+    format!("amqp-client-recovery-{}-{}", label, std::process::id())
 }
 
 async fn recovering_client(proxy: &Proxy) -> Client {

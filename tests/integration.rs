@@ -2,7 +2,7 @@ mod support;
 
 use std::time::Duration;
 
-use amqp_client_rs::{
+use amqp_client::{
     BasicProperties, Channel, Connection, ConsumeOpts, ExchangeDeclareOpts, QueueDeclareOpts,
     QueueDeleteOpts, Table,
 };
@@ -13,7 +13,7 @@ const AMQP_URI: &str = "amqp://guest:guest@127.0.0.1";
 async fn setup(test_name: &str) -> (Connection, Channel, String) {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
-    let queue_name = format!("amqp-client-rs-test-{}-{}", test_name, std::process::id());
+    let queue_name = format!("amqp-client-test-{}-{}", test_name, std::process::id());
     let ok = ch
         .queue_declare(&queue_name, QueueDeclareOpts::default())
         .await
@@ -49,7 +49,7 @@ async fn connect_bad_host() {
 
 #[tokio::test]
 async fn connect_with_config() {
-    let config = amqp_client_rs::Config::from_uri(AMQP_URI).unwrap();
+    let config = amqp_client::Config::from_uri(AMQP_URI).unwrap();
     let conn = Connection::connect_with_config(config).await.unwrap();
     conn.close().await.unwrap();
 }
@@ -162,8 +162,8 @@ async fn publish_with_headers() {
 
     let mut headers = Table::new();
     headers.insert(
-        amqp_client_rs::ShortStr::try_from("x-custom").unwrap(),
-        amqp_client_rs::FieldValue::LongStr(amqp_client_rs::LongStr::from("value1")),
+        amqp_client::ShortStr::try_from("x-custom").unwrap(),
+        amqp_client::FieldValue::LongStr(amqp_client::LongStr::from("value1")),
     );
     let props = BasicProperties::builder()
         .content_type("application/json")
@@ -252,7 +252,7 @@ async fn queue_declare_and_delete() {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
 
-    let qname = format!("amqp-client-rs-test-decl-del-{}", std::process::id());
+    let qname = format!("amqp-client-test-decl-del-{}", std::process::id());
     let ok = ch
         .queue_declare(&qname, QueueDeclareOpts::default())
         .await
@@ -327,7 +327,7 @@ async fn exchange_declare_and_delete() {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
 
-    let ename = format!("amqp-client-rs-test-exch-{}", std::process::id());
+    let ename = format!("amqp-client-test-exch-{}", std::process::id());
     ch.exchange_declare(&ename, "direct", ExchangeDeclareOpts::default())
         .await
         .unwrap();
@@ -429,7 +429,7 @@ async fn exchange_fluent_wrapper() {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
 
-    let ename = format!("amqp-client-rs-test-fluent-exch-{}", std::process::id());
+    let ename = format!("amqp-client-test-fluent-exch-{}", std::process::id());
     ch.exchange_declare(&ename, "direct", ExchangeDeclareOpts::default())
         .await
         .unwrap();
@@ -483,7 +483,7 @@ async fn reopen_after_dropping_an_open_channel() {
 #[tokio::test]
 async fn reopen_after_broker_closed_a_channel() {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
-    let name = format!("amqp-client-rs-test-reopen-{}", std::process::id());
+    let name = format!("amqp-client-test-reopen-{}", std::process::id());
     let ch = conn.open_channel().await.unwrap();
     ch.exchange_declare(&name, "direct", ExchangeDeclareOpts::default())
         .await
@@ -530,7 +530,7 @@ async fn consumer_ends_when_the_connection_drops() {
     assert!(matches!(ended, Ok(None)), "consumer did not end");
     assert!(matches!(
         consumer.cancellation(),
-        Some(amqp_client_rs::CancellationReason::ConnectionClosed { .. })
+        Some(amqp_client::CancellationReason::ConnectionClosed { .. })
     ));
 }
 
@@ -574,7 +574,7 @@ async fn consumer_ends_when_the_connection_is_dropped_or_closed() {
 #[tokio::test]
 async fn heartbeat_timeout_ends_the_connection() {
     let proxy = support::proxy::Proxy::start().await;
-    let mut config = amqp_client_rs::Config::from_uri(&proxy.uri()).unwrap();
+    let mut config = amqp_client::Config::from_uri(&proxy.uri()).unwrap();
     config.heartbeat = 1;
     let conn = Connection::connect_with_config(config).await.unwrap();
     let ch = conn.open_channel().await.unwrap();
@@ -599,7 +599,7 @@ async fn heartbeat_timeout_ends_the_connection() {
     assert!(matches!(ended, Ok(None)), "consumer did not end");
     assert!(matches!(
         ch.queue_declare("", QueueDeclareOpts::default()).await,
-        Err(amqp_client_rs::Error::ConnectionClosed { .. })
+        Err(amqp_client::Error::ConnectionClosed { .. })
     ));
 }
 
@@ -608,7 +608,7 @@ async fn heartbeat_timeout_ends_the_connection() {
 #[tokio::test]
 async fn operations_on_a_broker_closed_channel_fail_fast() {
     let conn = Connection::connect(AMQP_URI).await.unwrap();
-    let name = format!("amqp-client-rs-test-closed-{}", std::process::id());
+    let name = format!("amqp-client-test-closed-{}", std::process::id());
     let ch = conn.open_channel().await.unwrap();
     ch.exchange_declare(&name, "direct", ExchangeDeclareOpts::default())
         .await
@@ -618,7 +618,7 @@ async fn operations_on_a_broker_closed_channel_fail_fast() {
         .await;
     assert!(matches!(
         refused,
-        Err(amqp_client_rs::Error::ChannelClosed { code: 406, .. })
+        Err(amqp_client::Error::ChannelClosed { code: 406, .. })
     ));
 
     let published = ch
@@ -626,7 +626,7 @@ async fn operations_on_a_broker_closed_channel_fail_fast() {
         .await;
     assert!(matches!(
         published,
-        Err(amqp_client_rs::Error::ChannelClosed { .. })
+        Err(amqp_client::Error::ChannelClosed { .. })
     ));
     let declared = tokio::time::timeout(
         Duration::from_secs(1),
@@ -636,7 +636,7 @@ async fn operations_on_a_broker_closed_channel_fail_fast() {
     .expect("RPC on a closed channel waited");
     assert!(matches!(
         declared,
-        Err(amqp_client_rs::Error::ChannelClosed { code: 406, .. })
+        Err(amqp_client::Error::ChannelClosed { code: 406, .. })
     ));
 
     conn.open_channel()
@@ -678,10 +678,7 @@ async fn publish_fails_once_the_connection_is_gone() {
         .basic_publish("", &ok.queue, b"x".to_vec(), BasicProperties::default())
         .await;
     assert!(
-        matches!(
-            published,
-            Err(amqp_client_rs::Error::ConnectionClosed { .. })
-        ),
+        matches!(published, Err(amqp_client::Error::ConnectionClosed { .. })),
         "publish after connection loss: {published:?}"
     );
 }
@@ -725,7 +722,7 @@ async fn ack_after_the_channel_is_dropped_fails() {
 
     assert!(matches!(
         msg.ack(),
-        Err(amqp_client_rs::Error::ChannelClosed { .. })
+        Err(amqp_client::Error::ChannelClosed { .. })
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
     let passive = QueueDeclareOpts {

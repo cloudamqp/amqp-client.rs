@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use amqp_client_rs::{Connection, ConsumeOpts, QueueDeclareOpts};
+use amqp_client::{Connection, ConsumeOpts, QueueDeclareOpts};
 
 const QUEUE: &str = "hello";
 const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);

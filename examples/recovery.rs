@@ -6,11 +6,11 @@
 
 use std::time::Duration;
 
-use amqp_client_rs::{Client, ExchangeOpts, QueueOpts, RecoveryConfig, SubscribeOpts};
+use amqp_client::{Client, ExchangeOpts, QueueOpts, RecoveryConfig, SubscribeOpts};
 use tokio::time::MissedTickBehavior;
 
 #[tokio::main]
-async fn main() -> Result<(), amqp_client_rs::Error> {
+async fn main() -> Result<(), amqp_client::Error> {
     tracing_subscriber::fmt().init();
     // Spawned so the Ctrl+C handler is installed right away, before connecting.
     let mut ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
