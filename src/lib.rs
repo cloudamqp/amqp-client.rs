@@ -15,9 +15,9 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use amqp_client_rs::{BasicProperties, Connection, QueueDeclareOpts};
+//! use amqp_client::{BasicProperties, Connection, QueueDeclareOpts};
 //!
-//! # async fn run() -> Result<(), amqp_client_rs::Error> {
+//! # async fn run() -> Result<(), amqp_client::Error> {
 //! let conn = Connection::connect("amqp://guest:guest@localhost").await?;
 //! let ch = conn.open_channel().await?;
 //! ch.queue_declare("hello", QueueDeclareOpts::default()).await?;

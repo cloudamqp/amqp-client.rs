@@ -1,4 +1,4 @@
-use amqp_client_rs::{
+use amqp_client::{
     BasicProperties, Client, Codec, Decode, Encode, Error, MessageMeta, QueueOpts, SubscribeOpts,
 };
 use serde::{Deserialize, Serialize};

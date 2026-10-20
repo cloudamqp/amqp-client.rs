@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use amqp_client_rs::{BasicProperties, Connection, ConsumeOpts, QueueDeclareOpts, QueueDeleteOpts};
+use amqp_client::{BasicProperties, Connection, ConsumeOpts, QueueDeclareOpts, QueueDeleteOpts};
 
 fn humanize(n: f64) -> String {
     if n >= 1_000_000.0 {
@@ -14,7 +14,7 @@ fn humanize(n: f64) -> String {
     }
 }
 
-const QUEUE: &str = "amqp-client-rs-benchmark";
+const QUEUE: &str = "amqp-client-benchmark";
 const URI: &str = "amqp://guest:guest@127.0.0.1";
 const DURATION: Duration = Duration::from_secs(30);
 const BODY: &[u8] = b"hello amqp-client.rs";

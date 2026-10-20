@@ -46,12 +46,12 @@ pub trait Decode<T>: Codec {
 /// Other types do not compile:
 ///
 /// ```compile_fail
-/// # use amqp_client_rs::{BasicProperties, ByteCodec, Encode};
+/// # use amqp_client::{BasicProperties, ByteCodec, Encode};
 /// ByteCodec.encode(&42u32, &mut BasicProperties::default());
 /// ```
 ///
 /// ```compile_fail
-/// # use amqp_client_rs::{ByteCodec, Decode, MessageMeta};
+/// # use amqp_client::{ByteCodec, Decode, MessageMeta};
 /// # fn f(meta: &MessageMeta<'_>) {
 /// let n: Result<u32, _> = ByteCodec.decode(b"42", meta);
 /// # }

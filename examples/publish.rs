@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use amqp_client_rs::{BasicProperties, Connection, QueueDeclareOpts};
+use amqp_client::{BasicProperties, Connection, QueueDeclareOpts};
 
 const QUEUE: &str = "hello";
 const BODY: &[u8] = b"Hello from amqp-client.rs!";
