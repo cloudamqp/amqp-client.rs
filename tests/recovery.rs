@@ -6,8 +6,8 @@ mod support;
 use std::time::{Duration, Instant};
 
 use amqp_client_rs::{
-    Client, Connection, Error, ExchangeDeclareOpts, QueueDeclareOk, QueueDeclareOpts,
-    QueueDeleteOpts, RecoveryConfig, SubscribeOpts,
+    Client, Connection, Error, ExchangeOpts, QueueDeclareOk, QueueDeclareOpts, QueueDeleteOpts,
+    QueueOpts, RecoveryConfig, SubscribeOpts,
 };
 use support::proxy::Proxy;
 
@@ -75,10 +75,7 @@ async fn publish_recovers_after_connection_loss() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("publish");
-    client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    client.queue(&queue, QueueOpts::default()).await.unwrap();
 
     proxy.cut();
 
@@ -134,13 +131,10 @@ async fn topology_is_declared_again_after_connection_loss() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let ex = client
-        .topic(&name("topology-ex"), ExchangeDeclareOpts::default())
+        .topic(&name("topology-ex"), ExchangeOpts::default())
         .await
         .unwrap();
-    let exclusive = QueueDeclareOpts {
-        exclusive: true,
-        ..Default::default()
-    };
+    let exclusive = QueueOpts::default().exclusive(true);
     let q = client.queue("", exclusive).await.unwrap();
     q.bind(&ex, "k").await.unwrap();
     let old_name = q.name();
@@ -172,10 +166,7 @@ async fn consumer_survives_connection_loss() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("consumer");
-    let q = client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&queue, QueueOpts::default()).await.unwrap();
     let mut consumer = q
         .subscribe::<Vec<u8>>(SubscribeOpts::default())
         .await
@@ -221,10 +212,7 @@ async fn dropping_the_client_ends_a_recovering_consumer() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("drop");
-    let q = client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&queue, QueueOpts::default()).await.unwrap();
     let mut consumer = q
         .subscribe::<Vec<u8>>(SubscribeOpts::default())
         .await
@@ -250,10 +238,7 @@ async fn dropping_the_client_ends_an_idle_consumer() {
             builder = builder.recovery(RecoveryConfig::default());
         }
         let client = builder.build().await.unwrap();
-        let exclusive = QueueDeclareOpts {
-            exclusive: true,
-            ..Default::default()
-        };
+        let exclusive = QueueOpts::default().exclusive(true);
         let q = client.queue("", exclusive).await.unwrap();
         let mut consumer = q
             .subscribe::<Vec<u8>>(SubscribeOpts::default())
@@ -277,10 +262,7 @@ async fn dropping_the_client_during_a_stalled_reconnect_ends_consumers() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("stalled");
-    let q = client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&queue, QueueOpts::default()).await.unwrap();
     let mut consumer = q
         .subscribe::<Vec<u8>>(SubscribeOpts::default())
         .await
@@ -335,10 +317,7 @@ async fn publish_confirmed_is_retried_when_it_was_never_sent() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("confirm-retry");
-    client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    client.queue(&queue, QueueOpts::default()).await.unwrap();
 
     proxy.cut();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -358,10 +337,7 @@ async fn an_operation_in_flight_at_connection_loss_is_retried() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     proxy.freeze();
-    let exclusive = QueueDeclareOpts {
-        exclusive: true,
-        ..Default::default()
-    };
+    let exclusive = QueueOpts::default().exclusive(true);
     let declare = tokio::spawn(async move { client.queue("", exclusive).await.map(|_| ()) });
     tokio::time::sleep(Duration::from_millis(200)).await;
     proxy.cut();
@@ -381,10 +357,7 @@ async fn concurrent_operations_share_one_recovery() {
     let proxy = Proxy::start().await;
     let client = std::sync::Arc::new(recovering_client(&proxy).await);
     let queue = name("concurrent");
-    client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    client.queue(&queue, QueueOpts::default()).await.unwrap();
 
     proxy.cut();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -411,7 +384,7 @@ async fn an_ended_consumer_is_not_recovery_demand() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let q = client
-        .queue(&name("ended"), QueueDeclareOpts::default())
+        .queue(&name("ended"), QueueOpts::default())
         .await
         .unwrap();
     let mut consumer = q
@@ -445,7 +418,7 @@ async fn a_zero_timeout_does_not_spin() {
         .await
         .unwrap();
     let q = client
-        .queue(&name("zero"), QueueDeclareOpts::default())
+        .queue(&name("zero"), QueueOpts::default())
         .await
         .unwrap();
     let mut consumer = q
@@ -469,10 +442,7 @@ async fn an_unpolled_recovering_consumer_does_not_block_a_delete() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("unpolled");
-    let q = client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&queue, QueueOpts::default()).await.unwrap();
     let mut consumer = q
         .subscribe::<Vec<u8>>(SubscribeOpts::default())
         .await
@@ -508,10 +478,7 @@ async fn a_consumer_recovers_while_not_polled() {
     let proxy = Proxy::start().await;
     let client = recovering_client(&proxy).await;
     let queue = name("unpolled-recovers");
-    let q = client
-        .queue(&queue, QueueDeclareOpts::default())
-        .await
-        .unwrap();
+    let q = client.queue(&queue, QueueOpts::default()).await.unwrap();
     let mut consumer = q
         .subscribe::<Vec<u8>>(SubscribeOpts::default())
         .await

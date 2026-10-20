@@ -3,12 +3,13 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::codec::{ByteCodec, Codec, Encode};
+use super::declare::{ExchangeOpts, QueueOpts};
 use super::encoding::{ContentEncoder, Identity};
 use super::exchange::{Exchange, ExchangeKind};
 use super::queue::Queue;
 use super::recovery::RecoveryConfig;
 use super::session::ClientInner;
-use crate::client::channel::{Channel, Confirmation, ExchangeDeclareOpts, QueueDeclareOpts};
+use crate::client::channel::{Channel, Confirmation};
 use crate::client::config::Config;
 use crate::error::Error;
 use crate::protocol::properties::BasicProperties;
@@ -66,14 +67,15 @@ impl<C: Codec> Client<C> {
     }
 
     /// Declare an exchange and record it, so it is declared again after
-    /// recovery.
+    /// recovery. Durable unless `opts` say otherwise.
     pub async fn exchange(
         &self,
         name: &str,
         kind: ExchangeKind,
-        opts: ExchangeDeclareOpts,
+        opts: ExchangeOpts,
     ) -> Result<Exchange, Error> {
         let kind = kind.as_str();
+        let opts = opts.resolve();
         self.inner
             .with_session(|s| {
                 let opts = opts.clone();
@@ -89,28 +91,30 @@ impl<C: Codec> Client<C> {
     }
 
     /// Declare a direct exchange. See [`Client::exchange`].
-    pub async fn direct(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+    pub async fn direct(&self, name: &str, opts: ExchangeOpts) -> Result<Exchange, Error> {
         self.exchange(name, ExchangeKind::Direct, opts).await
     }
 
     /// Declare a fanout exchange. See [`Client::exchange`].
-    pub async fn fanout(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+    pub async fn fanout(&self, name: &str, opts: ExchangeOpts) -> Result<Exchange, Error> {
         self.exchange(name, ExchangeKind::Fanout, opts).await
     }
 
     /// Declare a topic exchange. See [`Client::exchange`].
-    pub async fn topic(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+    pub async fn topic(&self, name: &str, opts: ExchangeOpts) -> Result<Exchange, Error> {
         self.exchange(name, ExchangeKind::Topic, opts).await
     }
 
     /// Declare a headers exchange. See [`Client::exchange`].
-    pub async fn headers(&self, name: &str, opts: ExchangeDeclareOpts) -> Result<Exchange, Error> {
+    pub async fn headers(&self, name: &str, opts: ExchangeOpts) -> Result<Exchange, Error> {
         self.exchange(name, ExchangeKind::Headers, opts).await
     }
 
     /// Declare a queue and record it, so it is declared again after recovery.
-    /// An empty `name` lets the broker name the queue.
-    pub async fn queue(&self, name: &str, opts: QueueDeclareOpts) -> Result<Queue<C>, Error> {
+    /// An empty `name` lets the broker name the queue. See [`QueueOpts`] for
+    /// what is durable by default.
+    pub async fn queue(&self, name: &str, opts: QueueOpts) -> Result<Queue<C>, Error> {
+        let opts = opts.resolve(name);
         let ok = self
             .inner
             .with_session(|s| {
