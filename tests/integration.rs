@@ -243,6 +243,52 @@ async fn basic_consume_nack_requeue() {
     teardown(ch, conn, &queue).await;
 }
 
+/// Regression test for a race where `basic_consume` registered the consumer
+/// in `consumer_senders` only *after* its `Basic.ConsumeOk` RPC future
+/// resolved. With messages already sitting in the queue and a low prefetch,
+/// the broker pushes `Basic.Deliver` frames for them immediately behind
+/// `Basic.ConsumeOk`, and the channel's dispatch task — a separate,
+/// continuously-running task — could read and process those deliveries
+/// before the `basic_consume` caller resumed and ran the registration,
+/// dropping them as "message for unknown consumer" (logged, never acked,
+/// stuck on the broker until the channel closed).
+#[tokio::test]
+async fn basic_consume_does_not_drop_deliveries_pending_at_consume_time() {
+    let (conn, ch, queue) = setup("consume-prefetch-race").await;
+
+    const N: usize = 50;
+    for i in 0..N {
+        ch.basic_publish(
+            "",
+            &queue,
+            format!("msg-{i}").as_bytes(),
+            BasicProperties::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    ch.basic_qos(2, false).await.unwrap();
+
+    let mut consumer = ch
+        .basic_consume(&queue, "test-prefetch-race", ConsumeOpts::default())
+        .await
+        .unwrap();
+
+    let mut received = 0;
+    for _ in 0..N {
+        let msg = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+            .await
+            .expect("timed out waiting for a delivery that was pending before basic_consume")
+            .unwrap();
+        msg.ack().unwrap();
+        received += 1;
+    }
+    assert_eq!(received, N);
+
+    teardown(ch, conn, &queue).await;
+}
+
 // -----------------------------------------------------------------------
 // Queue tests
 // -----------------------------------------------------------------------

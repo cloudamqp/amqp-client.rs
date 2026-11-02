@@ -231,6 +231,11 @@ enum RpcKind {
     /// `Header + Body` content frames that we bundle into a `GetMessage`
     /// before resolving.
     Get,
+    /// `Basic.Consume` reply (`Basic.ConsumeOk`). Carries the new
+    /// consumer's `ConsumerEntry` in the expectation so dispatch can
+    /// register it into `consumer_senders` itself, synchronously, while
+    /// still handling that frame — see `resolve_inflight_consume`.
+    Consume,
 }
 
 /// What dispatch produces and the RPC future receives.
@@ -261,6 +266,10 @@ enum RpcOutcome {
 struct RpcExpectation {
     kind: RpcKind,
     tx: tokio::sync::oneshot::Sender<RpcOutcome>,
+    /// Set only for `RpcKind::Consume`: the new consumer's sender half plus
+    /// cancellation slot, handed to dispatch so it can register the
+    /// consumer itself when the matching `Basic.ConsumeOk` arrives.
+    consumer_entry: Option<ConsumerEntry>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -682,24 +691,43 @@ impl Channel {
             arguments: opts.arguments,
         });
 
-        let response = self.expect_plain(method, "Basic.ConsumeOk").await?;
-        let tag = match response {
-            MethodFrame::BasicConsumeOk(ok) => ok.consumer_tag,
-            other => return Err(unexpected("Basic.ConsumeOk", &other)),
-        };
-
         // Create the bounded message channel for this consumer plus a
         // shared OnceLock the dispatch task writes into when the consumer
-        // ends (server cancel / channel close / connection close).
+        // ends (server cancel / channel close / connection close). Hand the
+        // entry to dispatch via the RPC expectation instead of inserting it
+        // into `consumer_senders` ourselves after the await returns: the
+        // broker can — and with a small prefetch, reliably does — push
+        // `Basic.Deliver` right behind `Basic.ConsumeOk`, and dispatch reads
+        // frames strictly in order on its own task. Registering here would
+        // leave a window where dispatch processes that delivery before this
+        // task resumes and runs the insert, dropping it as "message for
+        // unknown consumer". Registering inside dispatch itself, while it
+        // still holds the `Basic.ConsumeOk` frame, closes that window.
         let (msg_tx, msg_rx) = mpsc::channel(4096);
         let cancellation = Arc::new(OnceLock::new());
-        self.consumer_senders.lock().unwrap().insert(
-            tag.clone(),
-            ConsumerEntry {
-                sender: msg_tx,
-                cancellation: cancellation.clone(),
-            },
-        );
+        let entry = ConsumerEntry {
+            sender: msg_tx,
+            cancellation: cancellation.clone(),
+        };
+
+        let tag = match self.rpc_call(method, RpcKind::Consume, Some(entry)).await? {
+            RpcOutcome::Method(MethodFrame::BasicConsumeOk(ok)) => ok.consumer_tag,
+            RpcOutcome::Method(other) => return Err(unexpected("Basic.ConsumeOk", &other)),
+            RpcOutcome::ConnectionClosed => return Err(connection_closed()),
+            RpcOutcome::ChannelClosed { code, reason } => {
+                return Err(Error::ChannelClosed {
+                    channel_id: self.id,
+                    code,
+                    reason,
+                });
+            }
+            RpcOutcome::Get(_) | RpcOutcome::GetEmpty => {
+                return Err(Error::Protocol(crate::error::ProtocolError::UnexpectedMethod {
+                    expected: "Basic.ConsumeOk",
+                    got: "Get/GetEmpty (impossible for Consume kind)".into(),
+                }));
+            }
+        };
 
         debug!(channel_id = self.id, consumer_tag = %tag, "consumer started");
 
@@ -742,7 +770,7 @@ impl Channel {
             no_ack,
         });
 
-        match self.rpc_call(method, RpcKind::Get).await? {
+        match self.rpc_call(method, RpcKind::Get, None).await? {
             RpcOutcome::GetEmpty => Ok(None),
             RpcOutcome::Get(msg) => Ok(Some(msg)),
             RpcOutcome::ChannelClosed { code, reason } => Err(Error::ChannelClosed {
@@ -1040,7 +1068,12 @@ impl Channel {
     /// Body` content and bundles it into `RpcOutcome::Get(GetMessage)`
     /// before resolving — so an orphaned `basic_get` never leaves stray
     /// content frames to pollute the next call.
-    async fn rpc_call(&self, request: MethodFrame, kind: RpcKind) -> Result<RpcOutcome, Error> {
+    async fn rpc_call(
+        &self,
+        request: MethodFrame,
+        kind: RpcKind,
+        consumer_entry: Option<ConsumerEntry>,
+    ) -> Result<RpcOutcome, Error> {
         // Acquire the per-channel RPC lock as an owned guard. This guard
         // gets transferred to the dispatch task via the slot below.
         let guard = self.rpc_lock.clone().lock_owned().await;
@@ -1059,6 +1092,7 @@ impl Channel {
             *slot = Some(RpcExpectation {
                 kind,
                 tx,
+                consumer_entry,
                 _guard: guard,
             });
         }
@@ -1096,7 +1130,7 @@ impl Channel {
         request: MethodFrame,
         expected_label: &'static str,
     ) -> Result<MethodFrame, Error> {
-        match self.rpc_call(request, RpcKind::PlainMethod).await? {
+        match self.rpc_call(request, RpcKind::PlainMethod, None).await? {
             RpcOutcome::Method(m) => Ok(m),
             RpcOutcome::ConnectionClosed => Err(connection_closed()),
             RpcOutcome::ChannelClosed { code, reason } => Err(Error::ChannelClosed {
@@ -1270,6 +1304,21 @@ async fn dispatch_loop(
                     Err(e) => {
                         warn!(channel_id, error = %e, "failed to assemble GetOk content");
                     }
+                }
+            }
+            Frame::Method(_, MethodFrame::BasicConsumeOk(ok)) => {
+                let tag = ok.consumer_tag.clone();
+                if !resolve_inflight_consume(
+                    &inflight_rpc,
+                    &consumer_senders,
+                    tag.clone(),
+                    RpcOutcome::Method(MethodFrame::BasicConsumeOk(ok)),
+                ) {
+                    warn!(
+                        channel_id,
+                        consumer_tag = %tag,
+                        "Basic.ConsumeOk arrived with no matching RPC expectation; dropping"
+                    );
                 }
             }
             Frame::Method(_, MethodFrame::BasicGetEmpty) => {
@@ -1500,6 +1549,37 @@ fn resolve_inflight_get(slot: &Arc<Mutex<Option<RpcExpectation>>>, outcome: RpcO
     } else {
         false
     }
+}
+
+/// Like `resolve_inflight` but specific to `Basic.ConsumeOk`: registers the
+/// new consumer's entry into `consumer_senders`, keyed by the
+/// broker-confirmed `tag`, *before* resolving the oneshot — all while
+/// dispatch still owns the frame and hasn't read the next one. This closes
+/// the race where a `Basic.Deliver` for that consumer (which the broker can
+/// send immediately after `Basic.ConsumeOk`, and reliably does under a small
+/// prefetch) would otherwise reach `handle_deliver` before the `basic_consume`
+/// caller's task resumed and registered the entry itself.
+///
+/// Only takes the slot if the expectation is `RpcKind::Consume` — a
+/// mismatched kind here would be a protocol violation by the broker, so the
+/// expectation is left untouched and the orphan gets logged.
+fn resolve_inflight_consume(
+    slot: &Arc<Mutex<Option<RpcExpectation>>>,
+    consumer_senders: &Arc<Mutex<HashMap<ShortStr, ConsumerEntry>>>,
+    tag: ShortStr,
+    outcome: RpcOutcome,
+) -> bool {
+    let mut guard = slot.lock().unwrap();
+    let take = matches!(guard.as_ref(), Some(exp) if exp.kind == RpcKind::Consume);
+    if !take {
+        return false;
+    }
+    let mut expectation = guard.take().unwrap();
+    if let Some(entry) = expectation.consumer_entry.take() {
+        consumer_senders.lock().unwrap().insert(tag, entry);
+    }
+    let _ = expectation.tx.send(outcome);
+    true
 }
 
 /// Resolve pending publisher-confirm oneshots in response to a `Basic.Ack` or
@@ -1865,6 +1945,7 @@ mod tests {
         *slot.lock().unwrap() = Some(RpcExpectation {
             kind: RpcKind::PlainMethod,
             tx: tx_a,
+            consumer_entry: None,
             _guard: guard_a,
         });
         // _rx_a goes out of scope here — caller A "cancelled".
@@ -1911,6 +1992,7 @@ mod tests {
         *slot.lock().unwrap() = Some(RpcExpectation {
             kind: RpcKind::PlainMethod,
             tx,
+            consumer_entry: None,
             _guard: guard,
         });
         // resolve_inflight_get must not steal a PlainMethod expectation —
