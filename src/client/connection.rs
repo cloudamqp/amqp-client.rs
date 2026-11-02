@@ -331,6 +331,14 @@ impl Connection {
             ShortStr::try_from("connection.blocked").map_err(Error::Protocol)?,
             crate::protocol::table::FieldValue::Boolean(true),
         );
+        // Without this, a bad-credentials Start-Ok just gets the socket cut
+        // (the broker assumes we can't parse a Close this early), surfacing
+        // as an opaque I/O "early eof" instead of a Connection.Close we can
+        // report via Error::ConnectionClosed.
+        capabilities.insert(
+            ShortStr::try_from("authentication_failure_close").map_err(Error::Protocol)?,
+            crate::protocol::table::FieldValue::Boolean(true),
+        );
         client_properties.insert(
             ShortStr::try_from("capabilities").map_err(Error::Protocol)?,
             crate::protocol::table::FieldValue::Table(capabilities),
