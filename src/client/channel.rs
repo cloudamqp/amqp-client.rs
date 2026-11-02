@@ -1578,9 +1578,17 @@ fn resolve_inflight_consume(
     }
     let mut expectation = guard.take().unwrap();
     if let Some(entry) = expectation.consumer_entry.take() {
-        consumer_senders.lock().unwrap().insert(tag, entry);
+        consumer_senders.lock().unwrap().insert(tag.clone(), entry);
     }
-    let _ = expectation.tx.send(outcome);
+    if expectation.tx.send(outcome).is_err() {
+        // The caller's `basic_consume` future was dropped before this
+        // reply arrived (timeout, cancellation, ...), so nobody holds the
+        // receiver half any more. The broker still thinks this consumer is
+        // registered, but without this cleanup the dead entry would sit in
+        // `consumer_senders` until a delivery happens to arrive for it (it
+        // never will, on an idle queue) or the channel/connection closes.
+        consumer_senders.lock().unwrap().remove(&tag);
+    }
     true
 }
 
@@ -2003,6 +2011,87 @@ mod tests {
         assert!(!consumed);
         // Slot still has the PlainMethod expectation.
         assert!(slot.lock().unwrap().is_some());
+    }
+
+    /// Normal path: the caller is still waiting, so the entry registered by
+    /// `resolve_inflight_consume` must survive the call.
+    #[tokio::test]
+    async fn resolve_inflight_consume_registers_entry_when_caller_is_waiting() {
+        let rpc_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let slot: Arc<Mutex<Option<RpcExpectation>>> = Arc::new(Mutex::new(None));
+        let consumer_senders: Arc<Mutex<HashMap<ShortStr, ConsumerEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let guard = rpc_lock.lock_owned().await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<RpcOutcome>();
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        let tag = ShortStr::try_from("ctag").unwrap();
+        *slot.lock().unwrap() = Some(RpcExpectation {
+            kind: RpcKind::Consume,
+            tx,
+            consumer_entry: Some(ConsumerEntry {
+                sender: msg_tx,
+                cancellation: Arc::new(OnceLock::new()),
+            }),
+            _guard: guard,
+        });
+
+        let consumed = resolve_inflight_consume(
+            &slot,
+            &consumer_senders,
+            tag.clone(),
+            RpcOutcome::Method(MethodFrame::BasicConsumeOk(basic_method::ConsumeOk {
+                consumer_tag: tag.clone(),
+            })),
+        );
+
+        assert!(consumed);
+        assert!(consumer_senders.lock().unwrap().contains_key(&tag));
+        assert!(
+            rx.await.is_ok(),
+            "the caller's oneshot should still resolve"
+        );
+    }
+
+    /// If the caller's `basic_consume` future was dropped (cancelled, timed
+    /// out) before `Basic.ConsumeOk` arrived, the oneshot send fails. The
+    /// entry just registered must be removed again instead of leaking in
+    /// `consumer_senders` until an unrelated delivery or channel close
+    /// happens to clean it up.
+    #[tokio::test]
+    async fn resolve_inflight_consume_removes_entry_when_caller_is_gone() {
+        let rpc_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let slot: Arc<Mutex<Option<RpcExpectation>>> = Arc::new(Mutex::new(None));
+        let consumer_senders: Arc<Mutex<HashMap<ShortStr, ConsumerEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let guard = rpc_lock.lock_owned().await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<RpcOutcome>();
+        drop(rx); // simulates the caller's future being dropped mid-await
+        let (msg_tx, _msg_rx) = mpsc::channel(1);
+        let tag = ShortStr::try_from("ctag").unwrap();
+        *slot.lock().unwrap() = Some(RpcExpectation {
+            kind: RpcKind::Consume,
+            tx,
+            consumer_entry: Some(ConsumerEntry {
+                sender: msg_tx,
+                cancellation: Arc::new(OnceLock::new()),
+            }),
+            _guard: guard,
+        });
+
+        let consumed = resolve_inflight_consume(
+            &slot,
+            &consumer_senders,
+            tag.clone(),
+            RpcOutcome::Method(MethodFrame::BasicConsumeOk(basic_method::ConsumeOk {
+                consumer_tag: tag.clone(),
+            })),
+        );
+
+        assert!(consumed, "the Consume expectation should still be taken");
+        assert!(
+            consumer_senders.lock().unwrap().is_empty(),
+            "the orphaned entry must not be left registered"
+        );
     }
 
     /// `changed()` must not return spuriously while the watched value stays
