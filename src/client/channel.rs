@@ -722,10 +722,12 @@ impl Channel {
                 });
             }
             RpcOutcome::Get(_) | RpcOutcome::GetEmpty => {
-                return Err(Error::Protocol(crate::error::ProtocolError::UnexpectedMethod {
-                    expected: "Basic.ConsumeOk",
-                    got: "Get/GetEmpty (impossible for Consume kind)".into(),
-                }));
+                return Err(Error::Protocol(
+                    crate::error::ProtocolError::UnexpectedMethod {
+                        expected: "Basic.ConsumeOk",
+                        got: "Get/GetEmpty (impossible for Consume kind)".into(),
+                    },
+                ));
             }
         };
 
