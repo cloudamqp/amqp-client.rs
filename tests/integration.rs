@@ -3,8 +3,8 @@ mod support;
 use std::time::Duration;
 
 use amqp_client::{
-    BasicProperties, Channel, Connection, ConsumeOpts, ExchangeDeclareOpts, QueueDeclareOpts,
-    QueueDeleteOpts, Table,
+    BasicProperties, Channel, Connection, ConsumeOpts, Error, ExchangeDeclareOpts,
+    QueueDeclareOpts, QueueDeleteOpts, Table,
 };
 
 const AMQP_URI: &str = "amqp://guest:guest@127.0.0.1";
@@ -45,6 +45,19 @@ async fn connect_and_close() {
 async fn connect_bad_host() {
     let result = Connection::connect("amqp://guest:guest@127.0.0.1:19999").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn connect_bad_credentials_gets_clean_auth_error() {
+    let err = match Connection::connect("amqp://guest:wrong-password@127.0.0.1").await {
+        Ok(_) => panic!("connecting with a wrong password must not succeed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::ConnectionClosed { code: 403, .. }),
+        "expected a Connection.Close(ACCESS_REFUSED) from the broker, got: {err}"
+    );
 }
 
 #[tokio::test]
